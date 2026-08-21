@@ -1,0 +1,15 @@
+﻿Implement ProjectOS project registry and repository validation.
+
+Requirements:
+- Load config/projects.json with schema validation.
+- Each enabled entry has project_human_id and absolute repository_root.
+- Resolve the repository Git root and reject paths outside that root for project-scoped work.
+- Read <repository_root>/project/repository.json.
+- Require repository_type == delivery-project.
+- Require repository.json project_human_id == registry project_human_id.
+- Invoke the repository's projectctl status using that repository's Python environment/configuration.
+- Require exactly one active project and the same human ID.
+- Reject missing/malformed identity, duplicate registered IDs, duplicate roots, unbound templates, missing Git repositories, and identity mismatch.
+- Never auto-repair a mismatch.
+- Add `python -m projectos registry list|show|validate`.
+- Add unit tests for all mismatch cases.

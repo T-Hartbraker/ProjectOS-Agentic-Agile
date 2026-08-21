@@ -1,0 +1,39 @@
+﻿Implement ProjectOS orchestration persistence in state/projectos.db.
+
+Tables should cover:
+- registered_projects or registry snapshots
+- orchestration_jobs
+- orchestration_job_dependencies
+- worker_leases
+- run_events
+- scheduler_state
+- iteration_runs
+- release_runs
+
+Every orchestration job must include:
+- human_id
+- project_human_id
+- repository_root
+- iteration_human_id where applicable
+- work_item_type / work_item_human_id
+- agent_role
+- queue
+- status
+- priority
+- attempt / max_attempts
+- worktree_name/path
+- base_git_sha
+- candidate_git_sha
+- created/ready/started/completed timestamps
+- output_ref / last_error
+
+Statuses:
+QUEUED, READY, LEASED, RUNNING, SUCCEEDED, FAILED, BLOCKED,
+RETRY_WAIT, CANCELLED.
+
+Rules:
+- ProjectOS DB stores orchestration state only.
+- Requirements/stories/defects/releases remain in each repository's projectctl DB.
+- A job cannot be created until registry identity validation passes.
+- Persist a registry/repository identity snapshot with each run.
+- Add migrations and deterministic tests.

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      { "command": "powershell -ExecutionPolicy Bypass -File .cursor/hooks/before-shell.ps1" }
+    ],
+    "afterFileEdit": [
+      { "command": "powershell -ExecutionPolicy Bypass -File .cursor/hooks/after-file-edit.ps1" }
+    ],
+    "subagentStart": [
+      { "command": "powershell -ExecutionPolicy Bypass -File .cursor/hooks/subagent-audit.ps1" }
+    ],
+    "subagentStop": [
+      { "command": "powershell -ExecutionPolicy Bypass -File .cursor/hooks/subagent-audit.ps1" }
+    ]
+  }
+}
