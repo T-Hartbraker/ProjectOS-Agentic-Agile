@@ -103,6 +103,7 @@ def test_all_top_level_help() -> None:
         "daemon",
         "doctor",
         "fat",
+        "cursor",
     ):
         argv = ["--help"] if cmd is None else [cmd, "--help"]
         assert main(argv) == 0

@@ -1,0 +1,10 @@
+﻿Implement ProjectOS scheduler and daemon.
+Requirements:
+- Per-project schedule configuration.
+- One active iteration run per project/cadence window.
+- Scheduler selects only enabled, validated registered projects.
+- No duplicate run after restart/re-evaluation.
+- Failed release gates remain blocked; next schedule does not manufacture release.
+- Daemon commands: start/run, status, stop semantics appropriate for Windows.
+- Persist scheduler state in ProjectOS DB.
+- Add deterministic clock-based tests.

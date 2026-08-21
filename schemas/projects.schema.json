@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://projectos.local/schemas/projects.schema.json",
+  "title": "ProjectOS project registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "projects"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "projects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["project_human_id", "repository_root", "enabled"],
+        "properties": {
+          "project_human_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "repository_root": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Absolute path to the delivery-project repository root"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

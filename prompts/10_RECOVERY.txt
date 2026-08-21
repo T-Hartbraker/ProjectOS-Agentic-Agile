@@ -1,0 +1,8 @@
+﻿Implement `projectos recover`.
+- Expired leases return to retry/ready according to policy.
+- Revalidate every affected project's registry identity.
+- Reconcile recorded worktrees with each repository's `git worktree list --porcelain`.
+- Never adopt an unknown worktree automatically.
+- Never move a job to another repository during recovery.
+- Preserve candidate provenance.
+- Add interrupted-worker and identity-drift recovery tests.

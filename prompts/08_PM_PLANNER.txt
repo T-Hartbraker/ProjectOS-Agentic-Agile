@@ -1,0 +1,12 @@
+﻿Implement `python -m projectos plan --project <PRJ-ID>`.
+
+Requirements:
+- Resolve and validate the registered repository.
+- Read authoritative project state through projectctl adapter.
+- Invoke project-manager role in that repository.
+- Require schema-validated machine-readable plan.
+- Validate work-item IDs, queues, dependencies, duplicates, Sponsor authority.
+- Persist accepted jobs to ProjectOS DB with repository binding.
+- Do not execute jobs in plan command.
+- Support --dry-run.
+- Never create a new project from this command.

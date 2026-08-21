@@ -1,0 +1,12 @@
+﻿Implement ProjectOS worktree management.
+
+Requirements:
+- Worktree name includes project ID + iteration/job ID.
+- Worktrees are created from the registered project's Git repository only.
+- Record repository root, base SHA, branch, actual worktree path.
+- Reject a worktree whose Git common directory does not match the registered repository.
+- Prevent two active jobs from claiming one worktree.
+- Never force-delete dirty/unrecorded worktrees.
+- Cleanup only after integration or explicit abandonment.
+- Reconcile with `git worktree list --porcelain`.
+- Add collision, wrong-repository, dirty-cleanup, and discovery tests.

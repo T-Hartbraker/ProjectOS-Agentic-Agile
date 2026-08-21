@@ -1,0 +1,10 @@
+﻿Implement automated delivery-to-assurance handoff.
+- Successful DELIVERY captures exact candidate SHA.
+- Create required assurance jobs in ProjectOS DB.
+- Assurance worktree is from the same registered project repository.
+- QA references candidate SHA and source delivery run.
+- Blocking QA failure invokes project-local projectctl to create/update defect evidence.
+- Rework produces a new candidate requiring new QA.
+- Stale QA cannot approve a newer SHA.
+- Passing QA updates project-local evidence/traceability through projectctl.
+- Add pass, fail->defect, rework->retest, stale evidence, and wrong-repository tests.

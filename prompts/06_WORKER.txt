@@ -1,0 +1,19 @@
+﻿Implement the ProjectOS worker.
+
+Flow:
+1. Select eligible READY job.
+2. Revalidate registry + repository identity.
+3. Atomically acquire a time-limited lease.
+4. Transition LEASED -> RUNNING.
+5. Create/associate a worktree from that job's registered repository.
+6. Build role prompt with project/iteration/work item/acceptance criteria/ADR references.
+7. Invoke Cursor through centralized adapter.
+8. Persist raw output and run metadata.
+9. Capture base/candidate SHA and dirty state.
+10. SUCCEEDED means worker task completed, not QA/release acceptance.
+11. On failure persist error and retry only by policy.
+12. Release lease on all terminal paths.
+13. Recover expired leases after interruption.
+14. Never execute if project identity changes after job creation.
+Add success, timeout, nonzero exit, identity-change, expired lease,
+retry exhaustion, and crash-recovery tests.

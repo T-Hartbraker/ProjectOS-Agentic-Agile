@@ -1,0 +1,15 @@
+﻿Implement a repository-scoped projectctl adapter.
+
+Requirements:
+- Input: project_human_id plus projectctl arguments.
+- Resolve repository only through validated ProjectOS registry.
+- Execute with cwd = registered repository root.
+- Prefer <repo>\.venv\Scripts\python.exe when present.
+- Otherwise support an explicitly configured Python executable; do not silently use an unrelated repository's venv.
+- Run `python -m projectctl ...`.
+- Capture stdout/stderr/exit code/timestamps.
+- Require repository identity validation before every mutating call.
+- Provide read helpers for status, requirements, stories, defects, iterations, releases, traceability, audit.
+- Provide controlled mutation helpers needed by ProjectOS.
+- Never open or mutate project-control/project.db directly from ProjectOS.
+- Unit test wrong-root and wrong-project refusal.

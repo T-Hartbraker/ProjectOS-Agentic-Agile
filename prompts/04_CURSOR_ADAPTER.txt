@@ -1,0 +1,11 @@
+﻿Implement the ProjectOS Cursor Agent adapter.
+Requirements:
+- Validate project registry before invocation.
+- Workspace must equal the registered repository root or an owned worktree of that repository.
+- Use subprocess argument arrays, never untrusted shell strings.
+- Support prompt text/file, mode, output format, worktree name, timeout.
+- Capture stdout, stderr, exit code, timestamps, duration, raw output reference.
+- Preserve usage metadata when available; otherwise record unknown.
+- Redact obvious secrets.
+- Never equate Cursor exit 0 with QA acceptance.
+- Unit tests with mocked subprocess plus opt-in local integration test.

@@ -1,0 +1,12 @@
+﻿Implement bounded parallel dispatch.
+- Durable READY jobs are source of truth.
+- max_parallel_workers default 3.
+- Dependencies must be satisfied.
+- Worktree/resource exclusivity enforced.
+- Jobs from separate repositories may run concurrently.
+- Separate Cursor subprocess per active job.
+- Graceful shutdown stops new leases first.
+- Restart recovers expired leases.
+- Commands: dispatch --once and dispatch --until-idle.
+- Test two jobs in different repositories overlap while each remains in its own repo.
+- Test dependent jobs do not start early.
