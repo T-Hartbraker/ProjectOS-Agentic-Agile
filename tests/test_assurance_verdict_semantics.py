@@ -360,15 +360,30 @@ def test_inconclusive_gate_blocks_pm_remediation(tmp_path: Path) -> None:
     db, repo_root = _db(tmp_path)
     with connection(db) as conn:
         event_ctx = _seed_run(conn)
+        delivery = create_job(
+            conn,
+            human_id="DEL-INCONCLUSIVE",
+            project_human_id="PRJ-003",
+            repository_root=repo_root,
+            agent_role="DELIVERY",
+            queue="DELIVERY",
+            status="SUCCEEDED",
+            base_git_sha="shaA",
+            run_id=event_ctx.run_id,
+        )
+        conn.execute(
+            "UPDATE orchestration_jobs SET candidate_git_sha = ? WHERE id = ?",
+            ("shaA", delivery.id),
+        )
         for role in ("ASSURANCE_FUNCTIONAL", "ASSURANCE_INTEGRATION", "ASSURANCE_SECURITY", "ASSURANCE_QUALITY"):
             conn.execute(
                 """
                 INSERT INTO qa_evidence (
-                    project_human_id, repository_root, candidate_git_sha,
+                    project_human_id, repository_root, delivery_job_id, candidate_git_sha,
                     assurance_role, result, run_id
-                ) VALUES ('PRJ-003', ?, 'shaA', ?, 'inconclusive', ?)
+                ) VALUES ('PRJ-003', ?, ?, 'shaA', ?, 'inconclusive', ?)
                 """,
-                (repo_root, role, event_ctx.run_id),
+                (repo_root, delivery.id, role, event_ctx.run_id),
             )
         result = run_qa_with_remediation(
             conn,

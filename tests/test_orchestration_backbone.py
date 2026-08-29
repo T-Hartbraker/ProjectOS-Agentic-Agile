@@ -179,10 +179,10 @@ def test_slack_api_failure_does_not_lose_event(tmp_path: Path, monkeypatch) -> N
         emit_projectos_event(
             conn,
             ctx=EventContext(project_id="PRJ-003", slack_channel_id="C1", slack_thread_ts="1.0"),
-            event_type="QA_GATE_PASSED",
-            summary="QA passed",
+            event_type="HANDOFF_ACCEPTED",
+            summary="handoff accepted for outbox retry test",
             actor_id=ACTOR_PM,
-            evidence={"tests_total": 10, "tests_passed": 10, "gate": "PASSED"},
+            evidence={"note": "outbox resilience test"},
         )
     first = dispatch_event_outbox(ctx.db_path)
     assert first["failed"] == 1
@@ -219,6 +219,7 @@ def test_worker_failure_event_visible(tmp_path: Path) -> None:
     from projectos.cockpit_worker import emit_worker_terminal_event
 
     job = MagicMock()
+    job.id = None
     job.human_id = "JOB-001"
     job.project_human_id = "PRJ-003"
     job.queue = "ASSURANCE_FUNCTIONAL"
