@@ -83,7 +83,7 @@ class PythonDesktopAdapter:
         sha = _sha256_file(artifact_path)
         artifact = PackagingArtifact(
             artifact_name=artifact_path.name,
-            artifact_type="installer",
+            artifact_type="installer_placeholder",
             platform=platform,
             architecture=arch,
             local_path=artifact_path,

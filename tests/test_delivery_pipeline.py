@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from helpers import init_git_repo, write_identity, write_registry
+from projectos.db import connection
 from projectos.delivery.contract import infer_delivery_contract, load_delivery_contract
 from projectos.delivery.gates import GATE_STATUS_FAILED, GATE_STATUS_PASSED
 from projectos.delivery.manifest import build_release_manifest, validate_release_manifest
@@ -34,14 +36,61 @@ def _delivery_json(**overrides) -> dict:
     return base
 
 
+def _git_head(repo_root: Path) -> str:
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+
+
+def _seed_qa_pass(ctx: ServiceContext, *, project_id: str = "PRJ-004") -> str:
+    registry = json.loads(Path(ctx.registry_path).read_text(encoding="utf-8"))
+    repo_root = Path(registry["projects"][0]["repository_root"])
+    git_sha = _git_head(repo_root)
+    roles = (
+        "ASSURANCE_FUNCTIONAL",
+        "ASSURANCE_INTEGRATION",
+        "ASSURANCE_SECURITY",
+        "ASSURANCE_QUALITY",
+        "QA_MANAGER",
+    )
+    with connection(ctx.db_path) as conn:
+        for role in roles:
+            conn.execute(
+                """
+                INSERT INTO qa_evidence (
+                    project_human_id, repository_root, candidate_git_sha,
+                    assurance_role, result
+                ) VALUES (?, ?, ?, ?, 'pass')
+                """,
+                (project_id, str(repo_root), git_sha, role),
+            )
+    return git_sha
+
+
+def _prepare_release(svc: DeliveryService, ctx: ServiceContext, **kwargs):
+    git_sha = _seed_qa_pass(ctx)
+    return svc.prepare_release(
+        "PRJ-004",
+        release_human_id=kwargs.get("release_human_id", "REL-001"),
+        version=kwargs.get("version", "1.0.0"),
+        candidate_git_sha=git_sha,
+    )
+
+
 def _setup_project(tmp_path: Path) -> ServiceContext:
     repo = init_git_repo(tmp_path / "product")
     write_identity(repo, project_human_id="PRJ-004", project_name="Example Product")
     (repo / "pyproject.toml").write_text("[project]\nname='example'\nversion='0.1.0'\n", encoding="utf-8")
     (repo / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    (repo / "project").mkdir(exist_ok=True)
     (repo / "project" / "delivery.json").write_text(
         json.dumps(_delivery_json(github_release_enabled=False)),
         encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "project setup", "--author", "Test <test@example.com>"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
     )
     write_registry(
         tmp_path / "projects.json",
@@ -150,24 +199,26 @@ def test_prepare_package_verify_publish_local(tmp_path: Path, monkeypatch) -> No
     reload_github_tokens()
     ctx = _setup_project(tmp_path)
     svc = DeliveryService(ctx)
-    prepared = svc.prepare_release("PRJ-004", release_human_id="REL-001", version="1.0.0")
+    prepared = _prepare_release(svc, ctx)
     record_id = prepared["release_record_id"]
     packaged = svc.package_release(record_id)
     assert packaged["build_id"]
-    installer = next(item for item in packaged["artifacts"] if item["artifact_type"] == "installer")
+    installer = next(
+        item for item in packaged["artifacts"] if item["artifact_type"] == "installer_placeholder"
+    )
     assert installer["sha256"]
     verified = svc.verify_release(record_id)
     assert verified["manifest_sha256"]
     published = svc.publish_release(record_id)
-    assert published["lifecycle_status"] == "released"
-    assert published["publication_status"] == "published"
+    assert published["lifecycle_status"] == "local_complete"
+    assert published["publication_status"] == "local_complete"
 
 
 def test_idempotent_prepare_and_publish(tmp_path: Path) -> None:
     ctx = _setup_project(tmp_path)
     svc = DeliveryService(ctx)
-    first = svc.prepare_release("PRJ-004", release_human_id="REL-001", version="1.0.0")
-    second = svc.prepare_release("PRJ-004", release_human_id="REL-001", version="1.0.0")
+    first = _prepare_release(svc, ctx)
+    second = _prepare_release(svc, ctx)
     assert first["release_record_id"] == second["release_record_id"]
     record_id = first["release_record_id"]
     svc.package_release(record_id)
@@ -207,7 +258,7 @@ def test_github_publication_mock(tmp_path: Path, monkeypatch) -> None:
 
     client = GitHubClient(http_post=fake_post, token="ghp_testtoken1234567890")
     svc = DeliveryService(ctx, github_client=client)
-    prepared = svc.prepare_release("PRJ-004", release_human_id="REL-001", version="1.0.0")
+    prepared = _prepare_release(svc, ctx)
     record_id = prepared["release_record_id"]
     svc.package_release(record_id)
     svc.verify_release(record_id)
@@ -260,7 +311,7 @@ def test_slack_release_announcement(tmp_path: Path) -> None:
     ctx = _setup_project(tmp_path)
     messages: list[str] = []
     svc = DeliveryService(ctx, slack_poster=messages.append)
-    prepared = svc.prepare_release("PRJ-004", release_human_id="REL-001", version="1.0.0")
+    prepared = _prepare_release(svc, ctx)
     record_id = prepared["release_record_id"]
     svc.package_release(record_id)
     svc.verify_release(record_id)

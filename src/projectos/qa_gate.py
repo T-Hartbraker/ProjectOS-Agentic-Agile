@@ -22,7 +22,7 @@ def collect_qa_gate_facts(
         clauses.append("e.candidate_git_sha = ?")
         params.append(candidate_git_sha)
     if run_id:
-        clauses.append("(e.run_id = ? OR e.run_id IS NULL)")
+        clauses.append("e.run_id = ?")
         params.append(run_id)
     rows = conn.execute(
         f"""

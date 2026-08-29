@@ -119,23 +119,58 @@ def _tag_evidence_run(
     )
 
 
+def _partition_assurance_jobs(
+    conn: sqlite3.Connection,
+    assurance_job_ids: list[int],
+    *,
+    retest_roles: list[str] | None = None,
+) -> tuple[list[int], int | None]:
+    assessor_ids: list[int] = []
+    manager_id: int | None = None
+    allowed = {r.upper() for r in retest_roles} if retest_roles else None
+    for job_id in assurance_job_ids:
+        job = get_job(conn, job_id)
+        if job is None:
+            continue
+        if job.queue == "QA_MANAGER":
+            manager_id = job_id
+        elif job.queue in ASSURANCE_QUEUES:
+            if allowed is None or job.queue.upper() in allowed:
+                assessor_ids.append(job_id)
+    return assessor_ids, manager_id
+
+
 def _run_assurance_via_worker(
     conn: sqlite3.Connection,
     *,
     service_ctx,
     assurance_job_ids: list[int],
+    retest_roles: list[str] | None = None,
 ) -> None:
     from projectos.services.facades import WorkerService
+    from projectos.worker_status import worker_succeeded
 
+    assessor_ids, manager_id = _partition_assurance_jobs(
+        conn, assurance_job_ids, retest_roles=retest_roles
+    )
     worker = WorkerService(service_ctx)
-    for job_id in assurance_job_ids:
+    for job_id in assessor_ids:
         job = get_job(conn, job_id)
         if job is None:
             raise OrchestrationError(f"Assurance job id={job_id} not found")
         outcome = worker.run_once(job_human_id=job.human_id)
-        if outcome.status != "succeeded":
+        if not worker_succeeded(outcome.status):
             raise OrchestrationError(
                 f"Assurance worker {job.human_id} execution failed: {outcome.message}"
+            )
+    if manager_id is not None:
+        job = get_job(conn, manager_id)
+        if job is None:
+            raise OrchestrationError(f"QA Manager job id={manager_id} not found")
+        outcome = worker.run_once(job_human_id=job.human_id)
+        if not worker_succeeded(outcome.status):
+            raise OrchestrationError(
+                f"QA Manager worker {job.human_id} execution failed: {outcome.message}"
             )
 
 
@@ -165,6 +200,8 @@ def execute_qa_retest(
         component="qa_retest",
         operation="execute_qa_retest",
         in_project_scope=True,
+        service_ctx=service_ctx,
+        repository_root=repository_root,
         fn=lambda: _execute_qa_retest_impl(
             conn,
             event_ctx=event_ctx,
@@ -264,7 +301,12 @@ def _execute_qa_retest_impl(
             assurance_job_ids=assurance_ids,
         )
     elif service_ctx is not None:
-        _run_assurance_via_worker(conn, service_ctx=service_ctx, assurance_job_ids=assurance_ids)
+        _run_assurance_via_worker(
+            conn,
+            service_ctx=service_ctx,
+            assurance_job_ids=assurance_ids,
+            retest_roles=retest_roles,
+        )
     else:
         emit_projectos_event(
             conn,

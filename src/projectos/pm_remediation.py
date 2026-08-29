@@ -3,23 +3,24 @@
 from __future__ import annotations
 
 import sqlite3
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from projectos.candidate_model import (
     CANDIDATE_TYPE_GIT_SHA,
-    get_run_active_candidate_type,
     latest_candidate_sha,
     set_run_active_candidate,
 )
 from projectos.domain_events import ACTOR_PM, EventContext, emit_projectos_event
-from projectos.finding_routing import classify_finding_category, route_finding_to_agent
+from projectos.finding_fingerprint import durable_finding_id, finding_fingerprint
+from projectos.finding_routing import classify_finding_category
 from projectos.qa_gate import collect_qa_gate_facts, emit_qa_gate_evaluation, emit_qa_finding_created
 from projectos.qa_retest import AssuranceExecutor, execute_qa_retest
+from projectos.remediation_capability import group_findings_for_remediation, resolve_remediation_execution
 from projectos.remediation_executor import RemediationExecutionResult, RemediationWorker, execute_remediation_work
-from projectos.remediation_store import create_remediation_work
+from projectos.remediation_store import count_remediation_cycles, create_remediation_work
 from projectos.run_evidence import close_execution_run
+from projectos.run_liveness import assert_run_has_next_action
 from projectos.run_outcomes import OUTCOME_MAX_REMEDIATION_EXCEEDED
 
 DEFAULT_MAX_REMEDIATION_CYCLES = 3
@@ -34,8 +35,27 @@ class RemediationResult:
     findings: tuple[dict[str, Any], ...] = ()
 
 
-def _new_finding_id() -> str:
-    return f"FND-{uuid.uuid4().hex[:8].upper()}"
+def _build_finding(row) -> dict[str, Any]:
+    assurance_role = str(row["assurance_role"] or "assurance")
+    actual = str(row["result"] or row["last_error"] or "failed")
+    category = classify_finding_category(assurance_role=assurance_role, actual_condition=actual)
+    base = {
+        "category": category,
+        "severity": "high" if str(row["result"]) == "fail" else "medium",
+        "evidence": row["evidence_ref"] or row["last_error"] or "",
+        "affected_component": row["human_id"] or assurance_role,
+        "expected_condition": "assurance review passes",
+        "actual_condition": actual,
+        "recommended_owner_role": category,
+        "retryable": True,
+        "source_gate_or_review": assurance_role,
+        "qa_evidence_id": row["id"],
+        "candidate_git_sha": row["candidate_git_sha"],
+    }
+    fp = finding_fingerprint(base)
+    base["fingerprint"] = fp
+    base["finding_id"] = durable_finding_id(base, qa_evidence_id=int(row["id"]))
+    return base
 
 
 def collect_qa_findings(
@@ -51,7 +71,7 @@ def collect_qa_findings(
         clauses.append("e.candidate_git_sha = ?")
         params.append(candidate_git_sha)
     if run_id:
-        clauses.append("(e.run_id = ? OR e.run_id IS NULL)")
+        clauses.append("e.run_id = ?")
         params.append(run_id)
     rows = conn.execute(
         f"""
@@ -68,29 +88,12 @@ def collect_qa_findings(
     ).fetchall()
     findings: list[dict[str, Any]] = []
     for row in rows:
-        assurance_role = str(row["assurance_role"] or "assurance")
-        actual = str(row["result"] or row["last_error"] or "failed")
-        category = classify_finding_category(assurance_role=assurance_role, actual_condition=actual)
-        finding = {
-            "finding_id": _new_finding_id(),
-            "category": category,
-            "severity": "high" if str(row["result"]) == "fail" else "medium",
-            "evidence": row["evidence_ref"] or row["last_error"] or "",
-            "affected_component": row["human_id"] or assurance_role,
-            "expected_condition": "assurance review passes",
-            "actual_condition": actual,
-            "recommended_owner_role": category,
-            "retryable": True,
-            "source_gate_or_review": assurance_role,
-            "qa_evidence_id": row["id"],
-            "candidate_git_sha": row["candidate_git_sha"],
-        }
-        findings.append(finding)
+        findings.append(_build_finding(row))
     return findings
 
 
-def _finding_recurrence(conn: sqlite3.Connection, *, run_id: str, category: str) -> int:
-    """Count remediation cycles that addressed the same finding category."""
+def _finding_recurrence(conn: sqlite3.Connection, *, run_id: str, fingerprint: str) -> int:
+    """Count remediation cycles that addressed the same finding fingerprint."""
     import json
 
     rows = conn.execute(
@@ -110,7 +113,7 @@ def _finding_recurrence(conn: sqlite3.Connection, *, run_id: str, category: str)
         except json.JSONDecodeError:
             continue
         for item in evidence.get("findings") or []:
-            if str(item.get("category") or "") == category:
+            if str(item.get("fingerprint") or "") == fingerprint:
                 count += 1
                 break
     return count
@@ -175,49 +178,64 @@ def start_remediation_cycle(
         evidence=remediation_meta,
     )
 
-    assigned_agent, reason = route_finding_to_agent(findings[0] if findings else {})
-    work = create_remediation_work(
-        conn,
-        run_id=event_ctx.run_id or project_id,
-        project_id=project_id,
-        remediation_cycle=attempt_number,
-        finding_ids=[f["finding_id"] for f in findings],
-        assigned_agent=assigned_agent,
-        objective=f"Remediate QA findings for candidate {source_candidate}",
-        acceptance_criteria="Produce new candidate and pass independent QA retest.",
-        source_candidate_id=source_candidate,
-        repository_root=repository_root,
-        assignment_reason=reason,
-        findings=findings,
-    )
-    emit_projectos_event(
-        conn,
-        ctx=event_ctx,
-        event_type="AGENT_ASSIGNED",
-        summary=f"Assigned: {assigned_agent} for QA remediation.",
-        actor_id=ACTOR_PM,
-        phase="REMEDIATION",
-        metadata={
-            "agent_id": assigned_agent,
-            "finding_ids": [f["finding_id"] for f in findings],
-            "reason": reason,
-            "remediation_cycle": attempt_number,
-            "work_item_id": work.work_item_id,
-        },
-        evidence={"work_item_id": work.work_item_id, "orchestration_job_id": work.orchestration_job_id},
-    )
+    groups = group_findings_for_remediation(findings)
+    last_outcome: RemediationExecutionResult | None = None
+    for assigned_agent, execution_queue, group_findings, reason in groups:
+        owner, _, _, _ = resolve_remediation_execution(group_findings[0])
+        work = create_remediation_work(
+            conn,
+            run_id=event_ctx.run_id or project_id,
+            project_id=project_id,
+            remediation_cycle=attempt_number,
+            finding_ids=[f["finding_id"] for f in group_findings],
+            assigned_agent=assigned_agent,
+            objective=f"Remediate QA findings for candidate {source_candidate}",
+            acceptance_criteria="Produce new candidate and pass independent QA retest.",
+            source_candidate_id=source_candidate,
+            repository_root=repository_root,
+            assignment_reason=reason,
+            findings=group_findings,
+            execution_queue=execution_queue,
+            finding_owner=owner,
+        )
+        emit_projectos_event(
+            conn,
+            ctx=event_ctx,
+            event_type="AGENT_ASSIGNED",
+            summary=f"Assigned: {assigned_agent} for QA remediation.",
+            actor_id=ACTOR_PM,
+            phase="REMEDIATION",
+            metadata={
+                "agent_id": assigned_agent,
+                "finding_owner": owner,
+                "execution_queue": execution_queue,
+                "finding_ids": [f["finding_id"] for f in group_findings],
+                "reason": reason,
+                "remediation_cycle": attempt_number,
+                "work_item_id": work.work_item_id,
+            },
+            evidence={"work_item_id": work.work_item_id, "orchestration_job_id": work.orchestration_job_id},
+        )
+        last_outcome = execute_remediation_work(
+            conn,
+            work=work,
+            event_ctx=event_ctx,
+            project_id=project_id,
+            repository_root=repository_root,
+            worker=worker,
+            service_ctx=service_ctx,
+        )
+        if last_outcome.status != "COMPLETED" or not last_outcome.target_candidate_id:
+            return last_outcome
 
-    outcome = execute_remediation_work(
-        conn,
-        work=work,
-        event_ctx=event_ctx,
-        project_id=project_id,
-        repository_root=repository_root,
-        worker=worker,
-        service_ctx=service_ctx,
-    )
-    if outcome.status != "COMPLETED" or not outcome.target_candidate_id:
-        return outcome
+    outcome = last_outcome
+    if outcome is None or outcome.target_candidate_id is None:
+        return RemediationExecutionResult(
+            work_item_id="",
+            status="FAILED",
+            target_candidate_id=None,
+            evidence={"reason": "no_remediation_groups"},
+        )
 
     roles = [str(f.get("source_gate_or_review") or "") for f in findings if f.get("source_gate_or_review")]
     retest = execute_qa_retest(
@@ -283,6 +301,9 @@ def run_qa_with_remediation(
         component="pm_remediation",
         operation="run_qa_with_remediation",
         in_project_scope=True,
+        service_ctx=service_ctx,
+        worker=worker,
+        repository_root=repository_root,
         fn=lambda: _run_qa_with_remediation_impl(
             conn,
             event_ctx=event_ctx,
@@ -314,8 +335,10 @@ def _run_qa_with_remediation_impl(
         facts = emit_qa_gate_evaluation(conn, project_id=project_id, event_context=event_ctx)
         return RemediationResult(gate=str(facts.get("gate") or "PENDING"), remediation_cycles=0)
 
-    cycles = 0
-    while cycles < max_cycles:
+    while True:
+        cycles = count_remediation_cycles(conn, run_id=event_ctx.run_id)
+        if cycles >= max_cycles:
+            break
         candidate = latest_candidate_sha(conn, project_id=project_id, run_id=event_ctx.run_id)
         facts = emit_qa_gate_evaluation(
             conn,
@@ -328,6 +351,18 @@ def _run_qa_with_remediation_impl(
         if gate == "PASSED":
             return RemediationResult(gate=gate, remediation_cycles=cycles, findings=())
         if gate == "INCONCLUSIVE":
+            emit_projectos_event(
+                conn,
+                ctx=event_ctx,
+                event_type="ASSURANCE_RETRY_SCHEDULED",
+                summary="PM scheduled assurance retry for inconclusive QA gate.",
+                actor_id=ACTOR_PM,
+                phase="QA_GATE",
+                evidence={"qa": facts, "candidate_git_sha": candidate},
+            )
+            assert_run_has_next_action(
+                conn, run_id=event_ctx.run_id, project_id=project_id
+            )
             return RemediationResult(gate=gate, remediation_cycles=cycles, findings=())
         if gate != "FAILED":
             return RemediationResult(gate=gate, remediation_cycles=cycles, findings=())
@@ -339,7 +374,9 @@ def _run_qa_with_remediation_impl(
             run_id=event_ctx.run_id,
         )
         for finding in findings:
-            recurrence = _finding_recurrence(conn, run_id=event_ctx.run_id, category=finding["category"])
+            recurrence = _finding_recurrence(
+                conn, run_id=event_ctx.run_id, fingerprint=finding["fingerprint"]
+            )
             if recurrence >= max_same_finding_recurrence:
                 emit_projectos_event(
                     conn,
@@ -362,14 +399,13 @@ def _run_qa_with_remediation_impl(
                     gate="FAILED", remediation_cycles=cycles, escalated=True, findings=tuple(findings)
                 )
 
-        cycles += 1
         start_remediation_cycle(
             conn,
             event_ctx=event_ctx,
             project_id=project_id,
             facts=facts,
             findings=findings,
-            attempt_number=cycles,
+            attempt_number=cycles + 1,
             repository_root=repository_root,
             worker=worker,
             service_ctx=service_ctx,

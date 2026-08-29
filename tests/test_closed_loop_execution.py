@@ -172,13 +172,16 @@ def test_developer_remediation_uses_delivery_queue(tmp_path: Path) -> None:
             repository_root=repo_root,
             assignment_reason="test",
         )
-        job = get_job_by_human_id(
-            conn,
-            f"{event_ctx.run_id}__REMEDIATION_1__developer-agent",
-        )
+        job = conn.execute(
+            """
+            SELECT human_id, queue, agent_role FROM orchestration_jobs
+            WHERE human_id LIKE ? AND queue = 'DELIVERY'
+            """,
+            (f"{event_ctx.run_id}__WORK_%__developer",),
+        ).fetchone()
     assert job is not None
-    assert job.queue == "DELIVERY"
-    assert job.agent_role == "DELIVERY"
+    assert job["queue"] == "DELIVERY"
+    assert job["agent_role"] == "DELIVERY"
 
 
 def test_work_completed_requires_work_item(tmp_path: Path) -> None:

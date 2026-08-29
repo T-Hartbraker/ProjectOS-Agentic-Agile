@@ -38,7 +38,9 @@ from projectos.delivery.events import (
     emit_signature_status,
     emit_source_gate_passed,
 )
-from projectos.domain_events import EventContext
+from projectos.candidate_workspace import candidate_workspace
+from projectos.delivery.qa_verification import require_qa_gate_passed
+from projectos.errors import OrchestrationError
 from projectos.delivery.store import (
     append_delivery_audit,
     get_delivery_release,
@@ -80,6 +82,14 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _primary_distributable_artifact(artifacts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for artifact_type in ("installer", "installer_placeholder", "zip", "package"):
+        match = next((row for row in artifacts if row["artifact_type"] == artifact_type), None)
+        if match is not None:
+            return match
+    return None
 
 
 def _git_head_sha(repo_root: Path) -> str:
@@ -145,14 +155,20 @@ class DeliveryService:
         release_human_id: str,
         version: str,
         candidate_git_sha: str | None = None,
+        run_id: str | None = None,
         proposal_id: str | None = None,
         sponsor_user_id: str | None = None,
         event_context: EventContext | None = None,
+        require_qa_evidence: bool = True,
     ) -> dict[str, Any]:
         parse_semver(version)
         repo_root = _resolve_repo_root(self.ctx, project_human_id)
         contract = load_delivery_contract(repo_root)
         self.validate_contract(project_human_id)
+        if require_qa_evidence and not candidate_git_sha:
+            raise OrchestrationError(
+                "Release preparation requires explicit QA-approved candidate_git_sha"
+            )
         git_sha = candidate_git_sha or _git_head_sha(repo_root)
         initialize_database(self.ctx.db_path)
         with connection(self.ctx.db_path) as conn:
@@ -162,7 +178,24 @@ class DeliveryService:
                 release_human_id=release_human_id,
             )
             if existing:
+                if str(existing.get("candidate_git_sha") or "") != git_sha:
+                    raise OrchestrationError(
+                        "Existing release record is for a different candidate SHA"
+                    )
+                if str(existing.get("version") or "") != version:
+                    raise OrchestrationError(
+                        "Existing release record is for a different version"
+                    )
                 return self._release_view(conn, existing)
+            if require_qa_evidence:
+                qa_facts = require_qa_gate_passed(
+                    conn,
+                    project_id=project_human_id,
+                    candidate_git_sha=git_sha,
+                    run_id=run_id or (event_context.run_id if event_context else None),
+                )
+            else:
+                qa_facts = {}
             release_record_id = new_release_record_id()
             record = insert_delivery_release(
                 conn,
@@ -183,7 +216,8 @@ class DeliveryService:
                 release_record_id=release_record_id,
                 gate_name="QA_GATE",
                 status=GATE_STATUS_PASSED,
-                detail="QA gate verified by PM before release preparation",
+                detail="QA gate verified from authoritative qa_evidence",
+                evidence=qa_facts,
             )
             upsert_gate_status(
                 conn,
@@ -253,36 +287,40 @@ class DeliveryService:
                 shutil.rmtree(build_dir, ignore_errors=True)
             if output_dir.exists():
                 shutil.rmtree(output_dir, ignore_errors=True)
+            candidate_sha = str(record["candidate_git_sha"])
             try:
-                executor_impl = select_build_executor(
-                    prefer_ci=executor.upper() == "CI",
-                    ci_available=resolve_github_credentials()["configured"],
-                )
-                build_result = executor_impl.run_release_build(
-                    repository=contract.repository_slug,
-                    git_sha=str(record["candidate_git_sha"]),
-                    version=str(record["version"]),
-                    workflow_inputs={"build_id": build_id, "release_record_id": release_record_id},
-                )
-                adapter.validate_environment(repo_root, contract)
-                adapter.build(repo_root, contract, git_sha=str(record["candidate_git_sha"]), build_dir=build_dir)
-                upsert_gate_status(
-                    conn,
-                    release_record_id=release_record_id,
-                    gate_name="BUILD_GATE",
-                    status=GATE_STATUS_PASSED,
-                    detail=build_result.detail,
-                    evidence=build_result.evidence,
-                )
-                result = adapter.package(
-                    repo_root,
-                    contract,
-                    version=str(record["version"]),
-                    git_sha=str(record["candidate_git_sha"]),
-                    build_dir=build_dir,
-                    output_dir=output_dir,
-                )
-                adapter.verify(result, contract)
+                with candidate_workspace(
+                    repo_root, candidate_sha, parent_dir=BUILD_ROOT / release_record_id
+                ) as workspace:
+                    executor_impl = select_build_executor(
+                        prefer_ci=executor.upper() == "CI",
+                        ci_available=False,
+                    )
+                    build_result = executor_impl.run_release_build(
+                        repository=contract.repository_slug,
+                        git_sha=candidate_sha,
+                        version=str(record["version"]),
+                        workflow_inputs={"build_id": build_id, "release_record_id": release_record_id},
+                    )
+                    adapter.validate_environment(workspace, contract)
+                    adapter.build(workspace, contract, git_sha=candidate_sha, build_dir=build_dir)
+                    upsert_gate_status(
+                        conn,
+                        release_record_id=release_record_id,
+                        gate_name="BUILD_GATE",
+                        status=GATE_STATUS_PASSED,
+                        detail=build_result.detail,
+                        evidence={**(build_result.evidence or {}), "workspace_sha": candidate_sha},
+                    )
+                    result = adapter.package(
+                        workspace,
+                        contract,
+                        version=str(record["version"]),
+                        git_sha=candidate_sha,
+                        build_dir=build_dir,
+                        output_dir=output_dir,
+                    )
+                    adapter.verify(result, contract)
                 upsert_gate_status(
                     conn,
                     release_record_id=release_record_id,
@@ -369,12 +407,23 @@ class DeliveryService:
                         gate_name="SBOM_GATE",
                         status=GATE_STATUS_NOT_REQUIRED,
                     )
-                signing_status = GATE_STATUS_PASSED if contract.code_signing_policy == "not_required" else GATE_STATUS_PENDING
+                signing_status = (
+                    GATE_STATUS_PASSED
+                    if contract.code_signing_policy == "not_required"
+                    else GATE_STATUS_PENDING
+                )
                 if contract.code_signing_policy == "required_for_production":
-                    if artifacts and artifacts[0]["signature_status"] in {"unsigned", "not_configured"}:
-                        signing_status = GATE_STATUS_PENDING if contract.github_release_enabled else GATE_STATUS_PASSED
+                    unsigned = [
+                        row
+                        for row in artifacts
+                        if str(row["signature_status"]) in {"unsigned", "not_configured"}
+                    ]
+                    if unsigned:
+                        signing_status = GATE_STATUS_PENDING
                     else:
                         signing_status = GATE_STATUS_PASSED
+                elif contract.code_signing_policy == "optional":
+                    signing_status = GATE_STATUS_PASSED
                 upsert_gate_status(
                     conn,
                     release_record_id=release_record_id,
@@ -449,9 +498,9 @@ class DeliveryService:
             repo_root = _resolve_repo_root(self.ctx, project_human_id)
             contract = load_delivery_contract(repo_root)
             artifacts = list_delivery_artifacts(conn, release_record_id)
-            installer = next((row for row in artifacts if row["artifact_type"] == "installer"), None)
+            installer = _primary_distributable_artifact(artifacts)
             if installer is None:
-                raise OrchestrationError("No installer artifact found for verification")
+                raise OrchestrationError("No distributable artifact found for verification")
             path = Path(str(installer["local_build_path"]))
             if not path.is_file():
                 raise OrchestrationError("Installer artifact file is missing on disk")
@@ -504,6 +553,14 @@ class DeliveryService:
                 detail="Manifest validated",
                 evidence={"manifest_sha256": manifest_sha},
             )
+            upsert_gate_status(
+                conn,
+                release_record_id=release_record_id,
+                gate_name="VERIFY_GATE",
+                status=GATE_STATUS_PASSED,
+                detail="Release verification completed",
+            )
+            update_delivery_release(conn, release_record_id, lifecycle_status="verified")
             return self._release_view(conn, get_delivery_release(conn, release_record_id=release_record_id) or record)
 
     def publish_release(
@@ -535,6 +592,9 @@ class DeliveryService:
             contract = load_delivery_contract(repo_root)
             announce_enabled = contract.slack_release_announcement_enabled
             gates = list_gate_statuses(conn, release_record_id)
+            if gates.get("VERIFY_GATE") not in {GATE_STATUS_PASSED, GATE_STATUS_NOT_REQUIRED, None}:
+                if gates.get("VERIFY_GATE") != GATE_STATUS_PASSED:
+                    raise OrchestrationError("Release verification required before publication")
             if gates.get("SIGNATURE_GATE") == GATE_STATUS_FAILED:
                 raise OrchestrationError("Signature gate failed; publication blocked")
             if gates.get("SIGNATURE_GATE") == GATE_STATUS_PENDING and contract.code_signing_policy == "required_for_production":
@@ -547,24 +607,16 @@ class DeliveryService:
                     conn,
                     release_record_id=release_record_id,
                     gate_name="PUBLICATION_GATE",
-                    status=GATE_STATUS_SKIPPED,
+                    status=GATE_STATUS_NOT_REQUIRED,
                 )
                 update_delivery_release(
                     conn,
                     release_record_id,
-                    publication_status="published",
-                    lifecycle_status="released",
+                    publication_status="local_complete",
+                    lifecycle_status="local_complete",
                 )
                 view = self._release_view(conn, get_delivery_release(conn, release_record_id=release_record_id) or record)
                 announce_view = view
-                emit_release_published(
-                    conn,
-                    project_id=project_human_id,
-                    release_human_id=str(record["release_human_id"]),
-                    release_record_id=release_record_id,
-                    url=str(view.get("github_release_url") or view.get("download_url") or ""),
-                    event_context=event_context,
-                )
             else:
                 artifacts = list_delivery_artifacts(conn, release_record_id)
                 assets: dict[str, tuple[bytes, str]] = {}
@@ -714,7 +766,7 @@ class DeliveryService:
             }
 
     def _announce_slack(self, view: dict[str, Any]) -> None:
-        installer = next((item for item in view.get("artifacts") or [] if item.get("artifact_type") == "installer"), None)
+        installer = _primary_distributable_artifact(view.get("artifacts") or [])
         if installer is None:
             return
         lines = [
