@@ -886,34 +886,40 @@ def run_recovery(
                 f"Ignored unknown worktree (not adopted): {path}"
             )
 
-        from projectos.domain_events import EventContext
-        from projectos.execution_run import get_execution_run
-        from projectos.remediation_recovery import resume_outstanding_remediation
-
         running = conn.execute(
             "SELECT run_id, project_id FROM execution_runs WHERE status = 'RUNNING'"
         ).fetchall()
-        for row in running:
-            run = get_execution_run(conn, str(row["run_id"]))
+        running_runs = [
+            (str(row["run_id"]), str(row["project_id"]))
+            for row in running
+        ]
+
+    from projectos.domain_events import EventContext
+    from projectos.execution_run import get_execution_run
+    from projectos.remediation_recovery import resume_outstanding_remediation
+
+    for run_id, proj_id in running_runs:
+        with connection(path) as conn:
+            run = get_execution_run(conn, run_id)
             if run is None:
                 continue
             event_ctx = EventContext(
-                project_id=str(row["project_id"]),
+                project_id=proj_id,
                 handoff_id=run.handoff_id,
-                run_id=str(row["run_id"]),
+                run_id=run_id,
             )
-            entry = load_registry(reg_path).get(str(row["project_id"]))
+            entry = load_registry(reg_path).get(proj_id)
             repo_root = str(entry.repository_root) if entry else "/"
             recovery = resume_outstanding_remediation(
                 conn,
                 event_ctx=event_ctx,
-                project_id=str(row["project_id"]),
+                project_id=proj_id,
                 repository_root=repo_root,
                 service_ctx=service_ctx,
             )
             if recovery.resumed:
                 report.messages.append(
-                    f"Resumed {recovery.resumed} remediation work for run {row['run_id']}"
+                    f"Resumed {recovery.resumed} remediation work for run {run_id}"
                 )
 
     return report

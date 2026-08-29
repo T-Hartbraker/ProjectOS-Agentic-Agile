@@ -8,6 +8,7 @@ from typing import Any
 
 from projectos.domain_events import (
     ACTOR_DELIVERY,
+    ACTOR_PM,
     ACTOR_RELEASE,
     EventContext,
     emit_projectos_event,

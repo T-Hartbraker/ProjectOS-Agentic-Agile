@@ -108,6 +108,7 @@ def create_assurance_jobs_for_delivery(
             candidate_git_sha=candidate_git_sha,
             assurance_role=queue,
             result="pending",
+            run_id=getattr(delivery, "run_id", None),
         )
         created.append(human_id)
 
@@ -126,6 +127,7 @@ def create_assurance_jobs_for_delivery(
         iteration_human_id=delivery.iteration_human_id,
         requires_worktree=False,
         identity_snapshot=identity,
+        run_id=getattr(delivery, "run_id", None),
     )
     set_job_source_provenance(
         conn,
@@ -149,6 +151,7 @@ def create_assurance_jobs_for_delivery(
         candidate_git_sha=candidate_git_sha,
         assurance_role=QA_MANAGER_ROLE,
         result="pending",
+        run_id=getattr(delivery, "run_id", None),
     )
     created.append(agg_id)
 

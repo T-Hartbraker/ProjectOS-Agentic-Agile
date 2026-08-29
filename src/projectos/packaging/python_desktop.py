@@ -76,14 +76,16 @@ class PythonDesktopAdapter:
         if contract.installer_format == "zip":
             artifact_path = output_dir / artifact_name.replace(".exe", ".zip")
             self._package_zip(repo_root, contract, artifact_path)
+            artifact_type = "zip"
         else:
             product_slug = product.replace(" ", "")
             artifact_path = output_dir / f"{product_slug}-installer-placeholder.json"
             self._package_stub_placeholder(repo_root, contract, artifact_path, version=version, git_sha=git_sha)
+            artifact_type = "installer_placeholder"
         sha = _sha256_file(artifact_path)
         artifact = PackagingArtifact(
             artifact_name=artifact_path.name,
-            artifact_type="installer_placeholder",
+            artifact_type=artifact_type,
             platform=platform,
             architecture=arch,
             local_path=artifact_path,
