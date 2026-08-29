@@ -304,6 +304,7 @@ def test_legacy_slack_outbox_receives_no_new_rows(tmp_path: Path) -> None:
 def test_qa_gate_atomic_with_outbox(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path)
     initialize_database(ctx.db_path)
+    repo_root = str((tmp_path / "alpha").resolve())
     with connection(ctx.db_path) as conn:
         conn.execute(
             """
@@ -322,6 +323,15 @@ def test_qa_gate_atomic_with_outbox(tmp_path: Path) -> None:
         )
         from projectos.qa_gate import emit_qa_gate_evaluation
 
+        conn.execute(
+            """
+            INSERT INTO qa_evidence (
+                project_human_id, repository_root, candidate_git_sha,
+                assurance_role, result, run_id
+            ) VALUES ('PRJ-003', ?, 'sha-pass', 'ASSURANCE_FUNCTIONAL', 'pass', 'RUN-QA')
+            """,
+            (repo_root,),
+        )
         emit_qa_gate_evaluation(
             conn,
             project_id="PRJ-003",

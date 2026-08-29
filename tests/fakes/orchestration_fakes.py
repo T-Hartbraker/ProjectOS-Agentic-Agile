@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+from projectos.assurance_verdict import VERDICT_FAIL, VERDICT_INCONCLUSIVE, VERDICT_PASS
 from projectos.candidate_model import CANDIDATE_TYPE_GIT_SHA
 from projectos.domain_events import EventContext
 from projectos.qa_handoff import record_assurance_result
@@ -66,13 +67,23 @@ def git_commit_file(repository_root: str | Path, relative_path: str, content: st
     return git_head_sha(repo)
 
 
+def _normalize_verdict(value: bool | str) -> str:
+    if isinstance(value, bool):
+        return VERDICT_PASS if value else VERDICT_FAIL
+    normalized = str(value).upper()
+    if normalized not in {VERDICT_PASS, VERDICT_FAIL, VERDICT_INCONCLUSIVE}:
+        raise ValueError(f"Invalid assurance verdict {value!r}")
+    return normalized
+
+
 def _record_assurance_for_candidate(
     conn: sqlite3.Connection,
     *,
     candidate_id: str,
-    passed: bool,
+    verdict: bool | str,
     evidence_ref: str,
     assurance_job_ids: list[int] | None = None,
+    findings: list[dict] | None = None,
 ) -> None:
     rows = conn.execute(
         """
@@ -85,6 +96,7 @@ def _record_assurance_for_candidate(
     if assurance_job_ids:
         allowed = set(assurance_job_ids)
         targets = [job_id for job_id in targets if job_id in allowed] or targets
+    normalized = _normalize_verdict(verdict)
     for job_id in targets:
         assurance = get_job(conn, job_id)
         if assurance is None:
@@ -92,15 +104,16 @@ def _record_assurance_for_candidate(
         record_assurance_result(
             conn,
             assurance,
-            passed=passed,
+            verdict=normalized,
             evidence_ref=evidence_ref,
+            findings=findings,
         )
 
 
 class SequencedAssuranceExecutor:
-    """Test-only assurance executor with explicit pass/fail sequence per call."""
+    """Test-only assurance executor with explicit verdict sequence per call."""
 
-    def __init__(self, outcomes: list[bool]) -> None:
+    def __init__(self, outcomes: list[bool | str]) -> None:
         self.outcomes = list(outcomes)
         self.calls: list[str] = []
 
@@ -120,20 +133,36 @@ class SequencedAssuranceExecutor:
         index = len(self.calls) - 1
         if index >= len(self.outcomes):
             raise AssertionError(f"No scripted assurance outcome for call {index + 1}")
-        passed = self.outcomes[index]
+        verdict = self.outcomes[index]
+        findings = None
+        if _normalize_verdict(verdict) == VERDICT_FAIL:
+            findings = [
+                {
+                    "finding_id": f"FND-TEST-{index + 1}",
+                    "category": "SOURCE_CODE_DEFECT",
+                    "severity": "high",
+                    "evidence": f"test failure on {candidate_id}",
+                    "affected_component": "test",
+                    "expected_condition": "pass",
+                    "actual_condition": "fail",
+                    "recommended_owner_role": "SOURCE_CODE_DEFECT",
+                    "retryable": True,
+                }
+            ]
         _record_assurance_for_candidate(
             conn,
             candidate_id=candidate_id,
-            passed=passed,
+            verdict=verdict,
             evidence_ref=f"fake-assurance:{candidate_id}:{index}",
             assurance_job_ids=assurance_job_ids or None,
+            findings=findings,
         )
 
 
 class FakeAssuranceExecutor:
     """Test-only assurance executor with explicit per-candidate outcomes."""
 
-    def __init__(self, outcomes: dict[str, bool]) -> None:
+    def __init__(self, outcomes: dict[str, bool | str]) -> None:
         self.outcomes = outcomes
         self.calls: list[str] = []
 
@@ -150,15 +179,31 @@ class FakeAssuranceExecutor:
         assurance_job_ids: list[int],
     ) -> None:
         self.calls.append(candidate_id)
-        passed = self.outcomes.get(candidate_id)
-        if passed is None:
+        verdict = self.outcomes.get(candidate_id)
+        if verdict is None:
             raise AssertionError(f"No scripted assurance outcome for candidate {candidate_id!r}")
+        findings = None
+        if _normalize_verdict(verdict) == VERDICT_FAIL:
+            findings = [
+                {
+                    "finding_id": f"FND-TEST-{candidate_id[:8]}",
+                    "category": "SOURCE_CODE_DEFECT",
+                    "severity": "high",
+                    "evidence": f"test failure on {candidate_id}",
+                    "affected_component": "test",
+                    "expected_condition": "pass",
+                    "actual_condition": "fail",
+                    "recommended_owner_role": "SOURCE_CODE_DEFECT",
+                    "retryable": True,
+                }
+            ]
         _record_assurance_for_candidate(
             conn,
             candidate_id=candidate_id,
-            passed=passed,
+            verdict=verdict,
             evidence_ref=f"fake-assurance:{candidate_id}",
             assurance_job_ids=assurance_job_ids or None,
+            findings=findings,
         )
 
 
