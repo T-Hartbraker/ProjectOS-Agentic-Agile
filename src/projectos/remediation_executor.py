@@ -55,9 +55,10 @@ def production_remediation_worker(
         raise OrchestrationError(f"Remediation job id={work.orchestration_job_id} not found")
 
     from projectos.services.facades import WorkerService
+    from projectos.worker_status import worker_succeeded
 
     outcome = WorkerService(service_ctx).run_once(job_human_id=job.human_id)
-    if outcome.status != "SUCCEEDED":
+    if not worker_succeeded(outcome.status):
         return RemediationExecutionResult(
             work_item_id=work.work_item_id,
             status="FAILED",
