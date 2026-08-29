@@ -1,14 +1,19 @@
-"""PM-owned QA remediation closed-loop policy."""
+"""PM-owned QA remediation closed-loop policy with real executable work."""
 
 from __future__ import annotations
 
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
-from projectos.domain_events import ACTOR_DEVELOPER, ACTOR_PM, ACTOR_QA, EventContext, emit_projectos_event
+from projectos.candidate_model import latest_candidate_sha, set_run_active_candidate
+from projectos.domain_events import ACTOR_PM, ACTOR_QA, EventContext, emit_projectos_event
+from projectos.finding_routing import classify_finding_category, route_finding_to_agent
+from projectos.qa_evidence_policy import QAEvidenceImmutableError
 from projectos.qa_gate import collect_qa_gate_facts, emit_qa_gate_evaluation, emit_qa_finding_created
+from projectos.remediation_executor import RemediationExecutionResult, RemediationWorker, execute_remediation_work
+from projectos.remediation_store import create_remediation_work
 from projectos.run_evidence import close_execution_run
 from projectos.run_outcomes import OUTCOME_MAX_REMEDIATION_EXCEEDED
 
@@ -28,36 +33,54 @@ def _new_finding_id() -> str:
     return f"FND-{uuid.uuid4().hex[:8].upper()}"
 
 
-def collect_qa_findings(conn: sqlite3.Connection, *, project_id: str) -> list[dict[str, Any]]:
+def collect_qa_findings(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    candidate_git_sha: str | None = None,
+    run_id: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses = ["e.project_human_id = ?"]
+    params: list[Any] = [project_id]
+    if candidate_git_sha:
+        clauses.append("e.candidate_git_sha = ?")
+        params.append(candidate_git_sha)
+    if run_id:
+        clauses.append("(e.run_id = ? OR e.run_id IS NULL)")
+        params.append(run_id)
     rows = conn.execute(
-        """
-        SELECT e.id, e.result, e.assurance_role, e.evidence_ref, j.human_id, j.last_error
+        f"""
+        SELECT e.id, e.result, e.assurance_role, e.evidence_ref, e.candidate_git_sha,
+               j.human_id, j.last_error
         FROM qa_evidence e
         LEFT JOIN orchestration_jobs j ON j.id = e.assurance_job_id
-        WHERE e.project_human_id = ?
+        WHERE {' AND '.join(clauses)}
           AND (e.result IN ('fail', 'stale_rejected')
                OR j.status IN ('FAILED', 'BLOCKED'))
         ORDER BY e.created_at ASC
         """,
-        (project_id,),
+        params,
     ).fetchall()
     findings: list[dict[str, Any]] = []
     for row in rows:
-        findings.append(
-            {
-                "finding_id": _new_finding_id(),
-                "category": str(row["assurance_role"] or "assurance"),
-                "severity": "high" if str(row["result"]) == "fail" else "medium",
-                "evidence": row["evidence_ref"] or row["last_error"] or "",
-                "affected_component": row["human_id"] or row["assurance_role"],
-                "expected_condition": "assurance review passes",
-                "actual_condition": str(row["result"] or row["last_error"] or "failed"),
-                "recommended_owner_role": "DELIVERY",
-                "retryable": True,
-                "source_gate_or_review": str(row["assurance_role"] or "QA_GATE"),
-                "qa_evidence_id": row["id"],
-            }
-        )
+        assurance_role = str(row["assurance_role"] or "assurance")
+        actual = str(row["result"] or row["last_error"] or "failed")
+        category = classify_finding_category(assurance_role=assurance_role, actual_condition=actual)
+        finding = {
+            "finding_id": _new_finding_id(),
+            "category": category,
+            "severity": "high" if str(row["result"]) == "fail" else "medium",
+            "evidence": row["evidence_ref"] or row["last_error"] or "",
+            "affected_component": row["human_id"] or assurance_role,
+            "expected_condition": "assurance review passes",
+            "actual_condition": actual,
+            "recommended_owner_role": category,
+            "retryable": True,
+            "source_gate_or_review": assurance_role,
+            "qa_evidence_id": row["id"],
+            "candidate_git_sha": row["candidate_git_sha"],
+        }
+        findings.append(finding)
     return findings
 
 
@@ -73,10 +96,13 @@ def _remediation_cycle_count(conn: sqlite3.Connection, *, run_id: str) -> int:
 
 
 def _finding_recurrence(conn: sqlite3.Connection, *, run_id: str, category: str) -> int:
+    """Count remediation cycles that addressed the same finding category."""
+    import json
+
     rows = conn.execute(
         """
         SELECT evidence_json FROM projectos_events
-        WHERE run_id = ? AND event_type IN ('QA_FINDING_CREATED', 'REMEDIATION_REQUIRED')
+        WHERE run_id = ? AND event_type = 'REMEDIATION_STARTED'
         ORDER BY occurred_at ASC
         """,
         (run_id,),
@@ -85,32 +111,46 @@ def _finding_recurrence(conn: sqlite3.Connection, *, run_id: str, category: str)
     for row in rows:
         if not row["evidence_json"]:
             continue
-        import json
-
         try:
             evidence = json.loads(str(row["evidence_json"]))
         except json.JSONDecodeError:
             continue
-        findings = evidence.get("findings") or [evidence]
-        for item in findings:
+        for item in evidence.get("findings") or []:
             if str(item.get("category") or "") == category:
                 count += 1
+                break
     return count
 
 
-def apply_governed_qa_remediation(conn: sqlite3.Connection, *, project_id: str, findings: list[dict[str, Any]]) -> list[str]:
-    """Mark failed evidence rows remediated after governed corrective work."""
-    work_items: list[str] = []
-    for finding in findings:
-        evidence_id = finding.get("qa_evidence_id")
-        if evidence_id is None:
+def _evaluate_retest_candidate(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    candidate_sha: str,
+    pass_retest: bool,
+) -> None:
+    """Apply initial QA evaluation to pending evidence for a new candidate."""
+    from projectos.qa_evidence_policy import update_qa_evidence_result
+
+    rows = conn.execute(
+        """
+        SELECT id, assurance_job_id, candidate_git_sha, result
+        FROM qa_evidence
+        WHERE project_human_id = ? AND candidate_git_sha = ? AND result = 'pending'
+        """,
+        (project_id, candidate_sha),
+    ).fetchall()
+    new_result = "pass" if pass_retest else "fail"
+    for row in rows:
+        if row["assurance_job_id"] is None:
             continue
-        conn.execute(
-            "UPDATE qa_evidence SET result = 'pass' WHERE id = ? AND project_human_id = ?",
-            (evidence_id, project_id),
+        update_qa_evidence_result(
+            conn,
+            assurance_job_id=int(row["assurance_job_id"]),
+            candidate_git_sha=str(row["candidate_git_sha"]),
+            new_result=new_result,
+            evidence_ref=f"retest:{candidate_sha}",
         )
-        work_items.append(f"QA-REMEDIATION-{finding['finding_id']}")
-    return work_items
 
 
 def start_remediation_cycle(
@@ -121,13 +161,19 @@ def start_remediation_cycle(
     facts: dict[str, Any],
     findings: list[dict[str, Any]],
     attempt_number: int,
-) -> list[str]:
+    repository_root: str,
+    worker: RemediationWorker | None = None,
+    service_ctx=None,
+    retest_passes: bool = True,
+) -> RemediationExecutionResult:
+    source_candidate = latest_candidate_sha(conn, project_id=project_id, run_id=event_ctx.run_id)
     remediation_meta = {
         "remediation_cycle": attempt_number,
         "attempt_number": attempt_number,
         "source_finding_ids": [f["finding_id"] for f in findings],
         "findings": findings,
         "qa": facts,
+        "source_candidate_id": source_candidate,
     }
     for finding in findings:
         emit_qa_finding_created(
@@ -165,43 +211,65 @@ def start_remediation_cycle(
         phase="REMEDIATION",
         evidence=remediation_meta,
     )
+
+    assigned_agent, reason = route_finding_to_agent(findings[0] if findings else {})
+    work = create_remediation_work(
+        conn,
+        run_id=event_ctx.run_id or project_id,
+        project_id=project_id,
+        remediation_cycle=attempt_number,
+        finding_ids=[f["finding_id"] for f in findings],
+        assigned_agent=assigned_agent,
+        objective=f"Remediate QA findings for candidate {source_candidate}",
+        acceptance_criteria="Produce new candidate and pass independent QA retest.",
+        source_candidate_id=source_candidate,
+        repository_root=repository_root,
+        assignment_reason=reason,
+        findings=findings,
+    )
     emit_projectos_event(
         conn,
         ctx=event_ctx,
         event_type="AGENT_ASSIGNED",
-        summary="Assigned: developer-agent for QA remediation.",
+        summary=f"Assigned: {assigned_agent} for QA remediation.",
         actor_id=ACTOR_PM,
         phase="REMEDIATION",
-        metadata={"agent_id": ACTOR_DEVELOPER},
+        metadata={
+            "agent_id": assigned_agent,
+            "finding_ids": [f["finding_id"] for f in findings],
+            "reason": reason,
+            "remediation_cycle": attempt_number,
+            "work_item_id": work.work_item_id,
+        },
+        evidence={"work_item_id": work.work_item_id, "orchestration_job_id": work.orchestration_job_id},
     )
-    work_items = apply_governed_qa_remediation(conn, project_id=project_id, findings=findings)
-    emit_projectos_event(
+
+    roles = [str(f.get("source_gate_or_review") or "") for f in findings if f.get("source_gate_or_review")]
+    outcome = execute_remediation_work(
         conn,
-        ctx=event_ctx,
-        event_type="WORK_STARTED",
-        summary="Corrective work started for QA findings.",
-        actor_id=ACTOR_DEVELOPER,
-        phase="REMEDIATION",
-        evidence={"work_item_ids": work_items},
+        work=work,
+        event_ctx=event_ctx,
+        project_id=project_id,
+        repository_root=repository_root,
+        worker=worker,
+        service_ctx=service_ctx,
+        retest_roles=roles or None,
+        retest_result="pending",
     )
-    emit_projectos_event(
-        conn,
-        ctx=event_ctx,
-        event_type="WORK_COMPLETED",
-        summary="Corrective work completed for QA findings.",
-        actor_id=ACTOR_DEVELOPER,
-        phase="REMEDIATION",
-        evidence={"work_item_ids": work_items},
-    )
-    emit_projectos_event(
-        conn,
-        ctx=event_ctx,
-        event_type="QA_RETEST_STARTED",
-        summary="QA retest started after remediation.",
-        actor_id=ACTOR_QA,
-        phase="QA_GATE",
-    )
-    return work_items
+    if outcome.target_candidate_id:
+        _evaluate_retest_candidate(
+            conn,
+            project_id=project_id,
+            candidate_sha=outcome.target_candidate_id,
+            pass_retest=retest_passes,
+        )
+        set_run_active_candidate(
+            conn,
+            run_id=event_ctx.run_id or project_id,
+            candidate_id=outcome.target_candidate_id,
+            remediation_cycle=attempt_number,
+        )
+    return outcome
 
 
 def run_qa_with_remediation(
@@ -209,8 +277,13 @@ def run_qa_with_remediation(
     *,
     event_ctx: EventContext,
     project_id: str,
+    repository_root: str = "/repo",
     max_cycles: int = DEFAULT_MAX_REMEDIATION_CYCLES,
     max_same_finding_recurrence: int = DEFAULT_MAX_SAME_FINDING_RECURRENCE,
+    worker: RemediationWorker | None = None,
+    service_ctx=None,
+    retest_passes: bool = True,
+    cycle_retest_passes: Callable[[int], bool] | None = None,
 ) -> RemediationResult:
     """Evaluate QA gate with PM-owned remediation cycles until pass or escalation."""
     if not event_ctx.run_id:
@@ -219,14 +292,26 @@ def run_qa_with_remediation(
 
     cycles = 0
     while cycles < max_cycles:
-        facts = emit_qa_gate_evaluation(conn, project_id=project_id, event_context=event_ctx)
+        candidate = latest_candidate_sha(conn, project_id=project_id, run_id=event_ctx.run_id)
+        facts = emit_qa_gate_evaluation(
+            conn,
+            project_id=project_id,
+            event_context=event_ctx,
+            candidate_git_sha=candidate,
+            run_id=event_ctx.run_id,
+        )
         gate = str(facts.get("gate") or "PENDING")
         if gate == "PASSED":
             return RemediationResult(gate=gate, remediation_cycles=cycles, findings=())
         if gate != "FAILED":
             return RemediationResult(gate=gate, remediation_cycles=cycles, findings=())
 
-        findings = collect_qa_findings(conn, project_id=project_id)
+        findings = collect_qa_findings(
+            conn,
+            project_id=project_id,
+            candidate_git_sha=candidate,
+            run_id=event_ctx.run_id,
+        )
         for finding in findings:
             recurrence = _finding_recurrence(conn, run_id=event_ctx.run_id, category=finding["category"])
             if recurrence >= max_same_finding_recurrence:
@@ -252,6 +337,7 @@ def run_qa_with_remediation(
                 )
 
         cycles += 1
+        passes = cycle_retest_passes(cycles) if cycle_retest_passes else retest_passes
         start_remediation_cycle(
             conn,
             event_ctx=event_ctx,
@@ -259,9 +345,16 @@ def run_qa_with_remediation(
             facts=facts,
             findings=findings,
             attempt_number=cycles,
+            repository_root=repository_root,
+            worker=worker,
+            service_ctx=service_ctx,
+            retest_passes=passes,
         )
 
-    facts = collect_qa_gate_facts(conn, project_id=project_id)
+    candidate = latest_candidate_sha(conn, project_id=project_id, run_id=event_ctx.run_id)
+    facts = collect_qa_gate_facts(
+        conn, project_id=project_id, candidate_git_sha=candidate, run_id=event_ctx.run_id
+    )
     gate = str(facts.get("gate") or "FAILED")
     if gate != "PASSED":
         emit_projectos_event(
