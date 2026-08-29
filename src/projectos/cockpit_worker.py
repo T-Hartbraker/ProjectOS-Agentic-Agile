@@ -14,6 +14,7 @@ from projectos.domain_events import (
     ACTOR_SECURITY,
     EventContext,
     emit_projectos_event,
+    lookup_event_context_for_job,
     lookup_event_context_for_project,
 )
 from projectos.store import OrchestrationJob
@@ -52,7 +53,9 @@ def emit_worker_cockpit_event(
     visibility: str = "SPONSOR",
     subscribers: tuple[str, ...] = ("slack",),
 ) -> None:
-    base = lookup_event_context_for_project(conn, job.project_human_id)
+    base = lookup_event_context_for_job(conn, job.id)
+    if base is None:
+        base = lookup_event_context_for_project(conn, job.project_human_id)
     if base is None:
         return
     ctx = EventContext(

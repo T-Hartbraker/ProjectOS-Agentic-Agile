@@ -273,6 +273,66 @@ def event_context_from_thread(
     )
 
 
+def lookup_event_context_for_job(
+    conn: sqlite3.Connection, job_id: int
+) -> EventContext | None:
+    from projectos.store import get_job
+
+    try:
+        resolved_id = int(job_id)
+    except (TypeError, ValueError):
+        return None
+    job = get_job(conn, resolved_id)
+    run_id = job.run_id
+    if not run_id:
+        row = conn.execute(
+            """
+            SELECT run_id FROM qa_evidence
+            WHERE assurance_job_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if row and row["run_id"]:
+            run_id = str(row["run_id"])
+    if not run_id:
+        row = conn.execute(
+            """
+            SELECT run_id FROM remediation_work
+            WHERE orchestration_job_id = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if row and row["run_id"]:
+            run_id = str(row["run_id"])
+    if not run_id:
+        return lookup_event_context_for_project(conn, job.project_human_id)
+    row = conn.execute(
+        """
+        SELECT h.project_id, h.handoff_id, r.run_id, h.team_id, h.channel_id, h.thread_ts
+        FROM execution_runs r
+        JOIN sponsor_handoffs h ON h.handoff_id = r.handoff_id
+        WHERE r.run_id = ?
+        LIMIT 1
+        """,
+        (run_id,),
+    ).fetchone()
+    if not row:
+        return EventContext(project_id=job.project_human_id, run_id=run_id)
+    return EventContext(
+        project_id=str(row["project_id"]),
+        handoff_id=str(row["handoff_id"]) if row["handoff_id"] else None,
+        run_id=str(row["run_id"]) if row["run_id"] else None,
+        job_id=job.human_id,
+        work_item_id=job.work_item_human_id,
+        correlation_id=str(row["run_id"]) if row["run_id"] else None,
+        slack_team_id=str(row["team_id"] or ""),
+        slack_channel_id=str(row["channel_id"]),
+        slack_thread_ts=str(row["thread_ts"]),
+    )
+
+
 def lookup_event_context_for_project(
     conn: sqlite3.Connection, project_id: str
 ) -> EventContext | None:

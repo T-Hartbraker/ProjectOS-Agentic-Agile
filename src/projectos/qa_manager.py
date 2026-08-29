@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from projectos.domain_events import ACTOR_QA, lookup_event_context_for_project
+from projectos.domain_events import ACTOR_QA, lookup_event_context_for_job
 from projectos.errors import OrchestrationError
 from projectos.qa_evidence_policy import update_qa_evidence_result
 from projectos.qa_gate import emit_qa_gate_evaluation
@@ -94,7 +94,7 @@ def execute_qa_manager_aggregation(
             "assessor_results": {str(r["assurance_role"]): str(r["result"]) for r in rows},
         },
     )
-    event_ctx = lookup_event_context_for_project(conn, job.project_human_id)
+    event_ctx = lookup_event_context_for_job(conn, job.id)
     if event_ctx is not None:
         from projectos.domain_events import emit_projectos_event
 
