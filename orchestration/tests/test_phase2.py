@@ -469,8 +469,7 @@ def test_qa_pass_fail_rework_and_stale_evidence(tmp_path: Path) -> None:
             create_defect_fn=lambda *a, **k: DefectOut(),
         )
         rework = get_job_by_human_id(conn, "JOB-D1__ASSURANCE_SECURITY__REWORK")
-        assert rework is not None
-        assert rework.queue == "DELIVERY"
+        assert rework is None
 
         # Stale evidence: delivery moved to new SHA
         conn.execute(

@@ -87,8 +87,10 @@ def _record_assurance_for_candidate(
 ) -> None:
     rows = conn.execute(
         """
-        SELECT assurance_job_id FROM qa_evidence
-        WHERE candidate_git_sha = ? AND result = 'pending' AND assurance_job_id IS NOT NULL
+        SELECT e.assurance_job_id FROM qa_evidence e
+        JOIN orchestration_jobs j ON j.id = e.assurance_job_id
+        WHERE e.candidate_git_sha = ? AND e.result = 'pending'
+          AND j.queue IN ('ASSURANCE_FUNCTIONAL', 'ASSURANCE_INTEGRATION', 'ASSURANCE_SECURITY', 'ASSURANCE_QUALITY')
         """,
         (candidate_id,),
     ).fetchall()
@@ -108,6 +110,23 @@ def _record_assurance_for_candidate(
             evidence_ref=evidence_ref,
             findings=findings,
         )
+    mgr_row = conn.execute(
+        """
+        SELECT j.id FROM orchestration_jobs j
+        JOIN qa_evidence e ON e.assurance_job_id = j.id
+        WHERE e.candidate_git_sha = ? AND j.queue = 'QA_MANAGER' AND e.result = 'pending'
+        """,
+        (candidate_id,),
+    ).fetchone()
+    if mgr_row is not None:
+        from projectos.qa_manager import execute_qa_manager_aggregation
+
+        mgr_job = get_job(conn, int(mgr_row["id"]))
+        if mgr_job is not None:
+            try:
+                execute_qa_manager_aggregation(conn, mgr_job)
+            except Exception:
+                pass
 
 
 class SequencedAssuranceExecutor:

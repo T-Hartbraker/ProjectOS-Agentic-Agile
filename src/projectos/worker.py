@@ -679,6 +679,10 @@ def run_once(
             maybe_handoff_after_delivery(conn, final)
         elif final.queue == "INTEGRATION":
             bind_dependent_release_jobs(conn, final)
+        elif final.queue == "QA_MANAGER" and final.source_candidate_sha:
+            from projectos.qa_manager import execute_qa_manager_aggregation
+
+            execute_qa_manager_aggregation(conn, final)
         elif final.queue in ASSURANCE_QUEUES and final.source_candidate_sha:
             process_assurance_worker_success(
                 conn,

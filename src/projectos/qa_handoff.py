@@ -111,14 +111,16 @@ def create_assurance_jobs_for_delivery(
         created.append(human_id)
 
     # QA Manager aggregation job waits on all assurance jobs.
+    from projectos.qa_manager import QA_MANAGER_ROLE
+
     agg_id = f"{delivery.human_id}__QA_MANAGER"
     agg = create_job(
         conn,
         human_id=agg_id,
         project_human_id=delivery.project_human_id,
         repository_root=delivery.repository_root,
-        agent_role="ASSURANCE_QUALITY",
-        queue="ASSURANCE_QUALITY",
+        agent_role=QA_MANAGER_ROLE,
+        queue=QA_MANAGER_ROLE,
         status="READY",
         iteration_human_id=delivery.iteration_human_id,
         requires_worktree=False,
@@ -137,6 +139,16 @@ def create_assurance_jobs_for_delivery(
         ).fetchone()
         if row:
             add_job_dependency(conn, agg.id, int(row[0]))
+    insert_qa_evidence(
+        conn,
+        project_human_id=delivery.project_human_id,
+        repository_root=delivery.repository_root,
+        delivery_job_id=delivery.id,
+        assurance_job_id=agg.id,
+        candidate_git_sha=candidate_git_sha,
+        assurance_role=QA_MANAGER_ROLE,
+        result="pending",
+    )
     created.append(agg_id)
 
     append_run_event(
@@ -395,22 +407,6 @@ def record_assurance_verdict(
                     if len(parts) >= 2:
                         defect_id = parts[1]
                         break
-        rework_id = f"{assurance.human_id}__REWORK"
-        rework = create_job(
-            conn,
-            human_id=rework_id,
-            project_human_id=assurance.project_human_id,
-            repository_root=assurance.repository_root,
-            agent_role="DELIVERY",
-            queue="DELIVERY",
-            status="READY",
-            iteration_human_id=assurance.iteration_human_id,
-            requires_worktree=True,
-            identity_snapshot=json.loads(assurance.identity_snapshot_json)
-            if assurance.identity_snapshot_json
-            else None,
-        )
-        add_job_dependency(conn, rework.id, assurance.id)
         if defect_id:
             conn.execute(
                 """
@@ -422,10 +418,10 @@ def record_assurance_verdict(
         append_run_event(
             conn,
             assurance.id,
-            "qa.failed_rework",
+            "qa.failed",
             status="FAILED",
-            message="Blocking QA failure; rework created",
-            payload={"rework_job": rework_id, "defect": defect_id},
+            message="QA failure recorded; PM owns corrective work",
+            payload={"defect": defect_id, "candidate_git_sha": expected},
         )
     return evidence_result
 

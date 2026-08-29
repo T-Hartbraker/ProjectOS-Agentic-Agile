@@ -225,7 +225,7 @@ def test_execution_success_with_fail_verdict(tmp_path: Path) -> None:
         ).fetchone()
         facts = collect_qa_gate_facts(conn, project_id="PRJ-003", candidate_git_sha="shaA")
     assert evidence == "fail"
-    assert rework is not None
+    assert rework is None
     assert facts["gate"] == "FAILED"
 
 
