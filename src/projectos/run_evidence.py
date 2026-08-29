@@ -321,74 +321,17 @@ def maybe_close_run_after_event(
     event_ctx: EventContext,
     event_type: str,
 ) -> None:
-    """PM observes downstream events and closes the run when appropriate."""
+    """PM observes downstream events — only PM terminal paths close runs here.
+
+    Operational evidence events (QA_GATE_FAILED, PACKAGE_FAILED, etc.) are
+  nonterminal and handled by PM remediation policy elsewhere.
+    """
     run_id = event_ctx.run_id
     if not run_id:
         return
-    run = get_execution_run(conn, run_id)
-    if run is None:
+    if get_execution_run(conn, run_id) is None:
         return
     if _run_already_terminal(conn, run_id):
-        return
-
-    if event_type in {"QA_GATE_FAILED", "PACKAGE_FAILED"}:
-        qa_evidence: dict[str, Any] = {}
-        fail_evt = conn.execute(
-            """
-            SELECT evidence_json, summary FROM projectos_events
-            WHERE run_id = ? AND event_type = ?
-            ORDER BY occurred_at DESC LIMIT 1
-            """,
-            (run_id, event_type),
-        ).fetchone()
-        if fail_evt and fail_evt["evidence_json"]:
-            try:
-                qa_evidence = json.loads(str(fail_evt["evidence_json"]))
-            except json.JSONDecodeError:
-                qa_evidence = {}
-        failure = {
-            "phase": "QA_GATE" if event_type == "QA_GATE_FAILED" else "PACKAGE",
-            "reason": str(fail_evt["summary"] if fail_evt else event_type),
-            "retryable": True,
-            "required_action": (
-                "Resolve QA findings or obtain governed override before release."
-                if event_type == "QA_GATE_FAILED"
-                else "Resolve packaging failure and retry."
-            ),
-        }
-        if qa_evidence:
-            failure["qa"] = qa_evidence
-        close_execution_run(
-            conn,
-            event_ctx=event_ctx,
-            outcome=OUTCOME_UNRECOVERABLE_TECHNICAL,
-            summary="Run blocked by downstream gate failure.",
-            failure=failure,
-        )
-        return
-
-    if event_type == "RELEASE_PREPARATION_BLOCKED":
-        block_evidence: dict[str, Any] = {}
-        fail_evt = conn.execute(
-            """
-            SELECT evidence_json, summary FROM projectos_events
-            WHERE run_id = ? AND event_type = 'RELEASE_PREPARATION_BLOCKED'
-            ORDER BY occurred_at DESC LIMIT 1
-            """,
-            (run_id,),
-        ).fetchone()
-        if fail_evt and fail_evt["evidence_json"]:
-            try:
-                block_evidence = json.loads(str(fail_evt["evidence_json"]))
-            except json.JSONDecodeError:
-                block_evidence = {}
-        close_execution_run(
-            conn,
-            event_ctx=event_ctx,
-            outcome=OUTCOME_UNRECOVERABLE_TECHNICAL,
-            summary=str(fail_evt["summary"] if fail_evt else "Release preparation blocked."),
-            failure=block_evidence or None,
-        )
         return
 
     if event_type == "RELEASE_PUBLISHED":
@@ -398,51 +341,3 @@ def maybe_close_run_after_event(
             outcome=OUTCOME_SUCCESS,
             summary="Release published successfully.",
         )
-        return
-
-    if event_type in {"DELIVERY_BLOCKED", "RELEASE_BLOCKED"}:
-        stub = False
-        evt = conn.execute(
-            """
-            SELECT evidence_json FROM projectos_events
-            WHERE run_id = ? AND event_type IN ('DELIVERY_BLOCKED', 'RELEASE_BLOCKED', 'PACKAGE_COMPLETED')
-            ORDER BY occurred_at DESC LIMIT 3
-            """,
-            (run_id,),
-        ).fetchall()
-        for row in evt:
-            if not row["evidence_json"]:
-                continue
-            try:
-                evidence = json.loads(str(row["evidence_json"]))
-            except json.JSONDecodeError:
-                continue
-            if evidence.get("stub_installer"):
-                stub = True
-        needs_installer = requires_production_installer(
-            conn, handoff_id=run.handoff_id, objective=run.objective
-        )
-        if stub and needs_installer:
-            close_execution_run(
-                conn,
-                event_ctx=event_ctx,
-                outcome=OUTCOME_UNRECOVERABLE_TECHNICAL,
-                summary="Requested finished installer cannot be supplied.",
-                detail=(
-                    "Package, checksum, and SBOM completed. "
-                    "Production installer adapter unavailable (python_desktop stub)."
-                ),
-                failure={
-                    "phase": "INSTALLER",
-                    "reason": "production installer adapter unavailable",
-                    "retryable": False,
-                    "required_action": "Provide production packaging adapter or adjust acceptance",
-                },
-            )
-        elif event_type == "RELEASE_BLOCKED":
-            close_execution_run(
-                conn,
-                event_ctx=event_ctx,
-                outcome=OUTCOME_UNRECOVERABLE_TECHNICAL,
-                summary="Publication blocked.",
-            )

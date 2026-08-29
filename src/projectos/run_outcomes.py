@@ -60,6 +60,26 @@ TERMINAL_RUN_EVENTS = frozenset(
     }
 )
 
+# Operational evidence events — never terminalize a run directly.
+OPERATIONAL_EVIDENCE_EVENTS = frozenset(
+    {
+        "QA_GATE_FAILED",
+        "QA_FINDING_CREATED",
+        "PACKAGE_FAILED",
+        "PUBLICATION_FAILED",
+        "WORK_FAILED",
+        "WORK_BLOCKED",
+        "RELEASE_PREPARATION_BLOCKED",
+        "DELIVERY_BLOCKED",
+        "RELEASE_BLOCKED",
+        "CAPABILITY_GAP_DETECTED",
+        "REMEDIATION_REQUIRED",
+        "REMEDIATION_LIMIT_REACHED",
+    }
+)
+
+PM_TERMINAL_RUN_EVENTS = TERMINAL_RUN_EVENTS | frozenset({"RUN_FAILED"})
+
 TERMINAL_RUN_STATUSES = frozenset(
     {
         STATUS_COMPLETED,
@@ -115,6 +135,14 @@ def is_terminal_run_event(event_type: str) -> bool:
 
 def is_terminal_run_status(status: str) -> bool:
     return str(status or "") in TERMINAL_RUN_STATUSES
+
+
+def is_pm_terminal_run_event(event_type: str) -> bool:
+    return str(event_type or "") in PM_TERMINAL_RUN_EVENTS
+
+
+def is_operational_evidence_event(event_type: str) -> bool:
+    return str(event_type or "") in OPERATIONAL_EVIDENCE_EVENTS
 
 
 def normalize_waiting_status(status: str) -> str:

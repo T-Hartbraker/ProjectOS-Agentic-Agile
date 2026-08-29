@@ -11,28 +11,47 @@ from projectos.run_outcomes import (
     EVENT_WAITING_FOR_SPONSOR,
     STATUS_WAITING_FOR_SPONSOR,
     TERMINAL_RUN_EVENTS,
+    is_pm_terminal_run_event,
     is_terminal_run_status,
 )
 
-_RUN_PROGRESSION = {
-    "HANDOFF_ACCEPTED": ("PLANNING", "pm-agent", 5),
-    "PM_PLAN_CREATED": ("PLANNING", "pm-agent", 15),
-    "AGENT_ASSIGNED": ("RUNNING", None, 25),
-    "WORK_STARTED": ("RUNNING", None, 35),
-    "WORK_PROGRESS": ("RUNNING", None, 50),
-    "PACKAGE_STARTED": ("RUNNING", "delivery-agent", 55),
-    "PACKAGE_COMPLETED": ("RUNNING", "delivery-agent", 75),
-    "PACKAGE_FAILED": ("BLOCKED", "delivery-agent", 65),
-    "QA_GATE_PASSED": ("RUNNING", "qa-agent", 50),
-    "QA_GATE_FAILED": ("BLOCKED", "qa-agent", 40),
-    "RELEASE_PUBLISHED": ("RUNNING", "release-agent", 90),
+# PM-authoritative terminal transitions only.
+_PM_TERMINAL_PROGRESSION = {
     "RUN_COMPLETED": ("COMPLETED", "pm-agent", 100),
     "RUN_BLOCKED": ("BLOCKED", None, 85),
     "RUN_ESCALATED": ("ESCALATED", "pm-agent", 88),
     "RUN_CANCELLED": ("CANCELLED", "pm-agent", 0),
-    "RUN_FAILED": ("FAILED", None, 90),
-    "WORK_FAILED": ("FAILED", None, 90),
-    "WORK_BLOCKED": ("BLOCKED", None, 85),
+    "RUN_FAILED": ("FAILED", None, 90),  # legacy alias
+}
+
+# Nonterminal progression — phase/agent/progress only; status unchanged unless paused.
+_OPERATIONAL_PROGRESSION = {
+    "HANDOFF_ACCEPTED": ("PLANNING", "pm-agent", 5),
+    "PM_PLAN_CREATED": ("PLANNING", "pm-agent", 15),
+    "PM_REPLAN": ("PLANNING", "pm-agent", 20),
+    "AGENT_ASSIGNED": ("RUNNING", None, 25),
+    "WORK_STARTED": ("RUNNING", None, 35),
+    "WORK_PROGRESS": ("RUNNING", None, 50),
+    "WORK_COMPLETED": ("RUNNING", None, 55),
+    "PACKAGE_STARTED": ("RUNNING", "delivery-agent", 55),
+    "PACKAGE_COMPLETED": ("RUNNING", "delivery-agent", 75),
+    "INSTALLER_BUILT": ("RUNNING", "delivery-agent", 80),
+    "INSTALLER_SIGNED": ("RUNNING", "delivery-agent", 85),
+    "QA_STARTED": ("RUNNING", "qa-agent", 45),
+    "QA_GATE_PASSED": ("RUNNING", "qa-agent", 50),
+    "QA_RETEST_STARTED": ("RUNNING", "qa-agent", 48),
+    "QA_GATE_FAILED": ("QA_GATE", "qa-agent", 40),
+    "REMEDIATION_REQUIRED": ("REMEDIATION", "pm-agent", 42),
+    "REMEDIATION_STARTED": ("REMEDIATION", None, 45),
+    "PACKAGE_FAILED": ("PACKAGE_GATE", "delivery-agent", 65),
+    "PUBLICATION_FAILED": ("PUBLICATION_GATE", "release-agent", 88),
+    "WORK_FAILED": ("WORK", None, 45),
+    "WORK_BLOCKED": ("WORK", None, 45),
+    "RELEASE_PREPARATION_BLOCKED": ("RELEASE_PREPARATION", "delivery-agent", 60),
+    "CAPABILITY_GAP_DETECTED": ("CAPABILITY", "pm-agent", 55),
+    "RELEASE_PUBLISHED": ("RUNNING", "release-agent", 90),
+    "SPONSOR_DIRECTIVE_RECEIVED": ("RUNNING", "pm-agent", 30),
+    "PLAN_UPDATED": ("RUNNING", "pm-agent", 32),
     "WAITING_FOR_SPONSOR": (STATUS_WAITING_FOR_SPONSOR, "pm-agent", 40),
     "SPONSOR_DECISION_REQUIRED": (STATUS_WAITING_FOR_SPONSOR, "pm-agent", 40),
 }
@@ -46,16 +65,29 @@ def apply_event_to_run(conn: sqlite3.Connection, *, run_id: str, event_type: str
         return
     if is_terminal_run_status(run.status) and event_type not in TERMINAL_RUN_EVENTS:
         return
-    mapping = _RUN_PROGRESSION.get(event_type)
-    status = payload.get("status")
+
     phase = payload.get("phase") or payload.get("event_type", "").lower()
     agent = payload.get("actor_id")
     progress = payload.get("progress")
-    if mapping:
-        mapped_status, mapped_agent, mapped_progress = mapping
-        status = mapped_status
-        agent = agent or mapped_agent
-        progress = progress if progress is not None else mapped_progress
+    status: str | None = None
+
+    if is_pm_terminal_run_event(event_type):
+        mapping = _PM_TERMINAL_PROGRESSION.get(event_type)
+        if mapping:
+            mapped_status, mapped_agent, mapped_progress = mapping
+            status = mapped_status
+            agent = agent or mapped_agent
+            progress = progress if progress is not None else mapped_progress
+    else:
+        mapping = _OPERATIONAL_PROGRESSION.get(event_type)
+        if mapping:
+            mapped_phase, mapped_agent, mapped_progress = mapping
+            phase = mapped_phase
+            agent = agent or mapped_agent
+            progress = progress if progress is not None else mapped_progress
+            if event_type in {EVENT_WAITING_FOR_SPONSOR, "SPONSOR_DECISION_REQUIRED"}:
+                status = STATUS_WAITING_FOR_SPONSOR
+
     evidence = payload.get("evidence")
     if isinstance(evidence, str):
         try:
