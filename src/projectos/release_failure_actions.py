@@ -94,6 +94,7 @@ def ensure_publication_failure_next_action(
         queue="DELIVERY",
         status="RETRY_WAIT",
         base_git_sha="",
+        run_id=event_ctx.run_id,
     )
     action_id = persist_run_next_action(
         conn,

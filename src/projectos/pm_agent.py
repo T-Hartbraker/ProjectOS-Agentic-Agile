@@ -656,6 +656,9 @@ def _orchestrate_release_capability_impl(
     except OrchestrationError as exc:
         failure = orchestration_blocker_from_message(str(exc), repo_root=repo_root)
         with connection(ctx.db_path) as block_conn:
+            from projectos.release_preparation_actions import ensure_release_preparation_next_action
+            from projectos.run_liveness import assert_nonterminal_run_has_durable_next_action
+
             if failure.get("blocker_type") == "DELIVERY_CONTRACT_MISSING" and repo_root:
                 from projectos.pm_delivery_remediation import attempt_delivery_contract_remediation
 
@@ -665,8 +668,16 @@ def _orchestrate_release_capability_impl(
                     repo_root=repo_root,
                     failure=failure,
                 )
-                block_conn.commit()
                 if remediation.sponsor_pause:
+                    ensure_release_preparation_next_action(
+                        block_conn,
+                        event_ctx=event_ctx,
+                        project_id=project_id,
+                        repository_root=repo_root,
+                        failure=failure,
+                        service_ctx=ctx,
+                    )
+                    block_conn.commit()
                     return (
                         f"*ProjectOS PM — WAITING FOR SPONSOR*\n"
                         f"Run: `{event_ctx.run_id}`\n"
@@ -687,22 +698,35 @@ def _orchestrate_release_capability_impl(
                         retry_failure = orchestration_blocker_from_message(
                             str(retry_exc), repo_root=repo_root
                         )
-                        with connection(ctx.db_path) as retry_conn:
-                            emit_projectos_event(
-                                retry_conn,
-                                ctx=event_ctx,
-                                event_type="RELEASE_PREPARATION_BLOCKED",
-                                summary=str(retry_exc)[:500],
-                                actor_id=ACTOR_PM,
-                                phase="RELEASE_PREPARATION",
-                                status="BLOCKED",
-                                detail_level="milestone",
-                                evidence=retry_failure,
-                            )
+                        emit_projectos_event(
+                            block_conn,
+                            ctx=event_ctx,
+                            event_type="RELEASE_PREPARATION_BLOCKED",
+                            summary=str(retry_exc)[:500],
+                            actor_id=ACTOR_PM,
+                            phase="RELEASE_PREPARATION",
+                            status="BLOCKED",
+                            detail_level="milestone",
+                            evidence=retry_failure,
+                        )
+                        ensure_release_preparation_next_action(
+                            block_conn,
+                            event_ctx=event_ctx,
+                            project_id=project_id,
+                            repository_root=repo_root,
+                            failure=retry_failure,
+                            service_ctx=ctx,
+                        )
+                        assert_nonterminal_run_has_durable_next_action(
+                            block_conn,
+                            run_id=event_ctx.run_id or project_id,
+                            project_id=project_id,
+                        )
+                        block_conn.commit()
                         return (
                             f"*ProjectOS PM — RELEASE PREPARATION BLOCKED*\n"
                             f"Run: `{event_ctx.run_id}`\n"
-                            "PM is managing remediation; run remains active."
+                            f"Next action scheduled: {retry_failure.get('blocker_type')}"
                         )
                 else:
                     emit_projectos_event(
@@ -716,27 +740,54 @@ def _orchestrate_release_capability_impl(
                         detail_level="milestone",
                         evidence=failure,
                     )
+                    ensure_release_preparation_next_action(
+                        block_conn,
+                        event_ctx=event_ctx,
+                        project_id=project_id,
+                        repository_root=repo_root,
+                        failure=failure,
+                        service_ctx=ctx,
+                    )
+                    assert_nonterminal_run_has_durable_next_action(
+                        block_conn,
+                        run_id=event_ctx.run_id or project_id,
+                        project_id=project_id,
+                    )
+                    block_conn.commit()
                     return (
                         f"*ProjectOS PM — RELEASE PREPARATION BLOCKED*\n"
                         f"Run: `{event_ctx.run_id}`\n"
-                        "PM is managing remediation; run remains active."
+                        f"Next action scheduled: {failure.get('blocker_type')}"
                     )
-            else:
-                emit_projectos_event(
-                    block_conn,
-                    ctx=event_ctx,
-                    event_type="RELEASE_PREPARATION_BLOCKED",
-                    summary=str(exc)[:500],
-                    actor_id=ACTOR_PM,
-                    phase="RELEASE_PREPARATION",
-                    status="BLOCKED",
-                    detail_level="milestone",
-                    evidence=failure,
-                )
+            emit_projectos_event(
+                block_conn,
+                ctx=event_ctx,
+                event_type="RELEASE_PREPARATION_BLOCKED",
+                summary=str(exc)[:500],
+                actor_id=ACTOR_PM,
+                phase="RELEASE_PREPARATION",
+                status="BLOCKED",
+                detail_level="milestone",
+                evidence=failure,
+            )
+            ensure_release_preparation_next_action(
+                block_conn,
+                event_ctx=event_ctx,
+                project_id=project_id,
+                repository_root=repo_root,
+                failure=failure,
+                service_ctx=ctx,
+            )
+            assert_nonterminal_run_has_durable_next_action(
+                block_conn,
+                run_id=event_ctx.run_id or project_id,
+                project_id=project_id,
+            )
+            block_conn.commit()
         return (
             f"*ProjectOS PM — RELEASE PREPARATION BLOCKED*\n"
             f"Run: `{event_ctx.run_id}`\n"
-            "PM is managing remediation; run remains active."
+            f"Next action scheduled: {failure.get('blocker_type')}"
         )
 
     release_record_id = str(prepared["release_record_id"])
