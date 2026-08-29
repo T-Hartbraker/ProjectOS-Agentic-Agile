@@ -735,12 +735,17 @@ def run_recovery(
     projectctl_runner=None,
     promote_retry_wait: bool = True,
     project_human_id: str | None = None,
+    service_ctx=None,
 ) -> RecoveryReport:
     """Run full ProjectOS recovery pass."""
     path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
     reg_path = (
         Path(registry_path) if registry_path is not None else DEFAULT_REGISTRY_PATH
     )
+    if service_ctx is None:
+        from projectos.services.context import ServiceContext
+
+        service_ctx = ServiceContext(db_path=path, registry_path=reg_path)
     initialize_database(path)
     report = RecoveryReport()
 
@@ -896,6 +901,7 @@ def run_recovery(
                 event_ctx=event_ctx,
                 project_id=str(row["project_id"]),
                 repository_root=repo_root,
+                service_ctx=service_ctx,
             )
             if recovery.resumed:
                 report.messages.append(
