@@ -72,7 +72,12 @@ def build_acceptance_contract(
     effective = list(dict.fromkeys(sponsor + policy))
 
     if str(request_type or "").upper() == "RELEASE":
-        baseline = ["release_record", "verified_artifact", "verify_gate"]
+        baseline = [
+            "release_record",
+            "verified_artifact",
+            "verify_gate",
+            "candidate_provenance",
+        ]
         effective = list(dict.fromkeys(baseline + effective))
         if not effective:
             return AcceptanceContract(
@@ -157,12 +162,28 @@ def evaluate_effective_requirements(
 
     _req("release_record", record is not None, record["release_record_id"] if record else None)
 
-    if candidate_git_sha and record is not None:
-        _req(
-            "candidate_provenance",
-            str(record.get("candidate_git_sha") or "") == candidate_git_sha,
-            {"expected": candidate_git_sha, "actual": record.get("candidate_git_sha")},
-        )
+    if "candidate_provenance" in required:
+        if not candidate_git_sha:
+            _req(
+                "candidate_provenance",
+                False,
+                {"reason": "missing_qa_approved_candidate"},
+            )
+        elif record is None:
+            _req(
+                "candidate_provenance",
+                False,
+                {"reason": "missing_release_record"},
+            )
+        else:
+            _req(
+                "candidate_provenance",
+                str(record.get("candidate_git_sha") or "") == candidate_git_sha,
+                {
+                    "expected": candidate_git_sha,
+                    "actual": record.get("candidate_git_sha"),
+                },
+            )
 
     distributables = (
         artifacts.get("zip")
