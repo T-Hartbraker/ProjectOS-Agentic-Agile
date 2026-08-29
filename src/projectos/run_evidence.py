@@ -331,6 +331,33 @@ def requires_production_installer(conn: sqlite3.Connection, *, handoff_id: str |
     return any(w in lowered for w in ("installer", "download", "publish", "release"))
 
 
+def _repository_root_for_run(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    project_id: str,
+) -> str | None:
+    row = conn.execute(
+        """
+        SELECT repository_root FROM orchestration_jobs
+        WHERE run_id = ? AND project_human_id = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (run_id, project_id),
+    ).fetchone()
+    if row and row["repository_root"]:
+        return str(row["repository_root"])
+    row = conn.execute(
+        """
+        SELECT repository_root FROM orchestration_jobs
+        WHERE project_human_id = ? AND repository_root IS NOT NULL
+        ORDER BY id DESC LIMIT 1
+        """,
+        (project_id,),
+    ).fetchone()
+    return str(row["repository_root"]) if row and row["repository_root"] else None
+
+
 def maybe_close_run_after_event(
     conn: sqlite3.Connection,
     *,
@@ -356,7 +383,17 @@ def maybe_close_run_after_event(
             return
         from projectos.sponsor_outcome import evaluate_sponsor_outcome
 
-        release_record_id = release_record_id_from_event(conn, run_id)
+        release_record_id = event_ctx.release_record_id or release_record_id_from_event(conn, run_id)
+        repository_root = _repository_root_for_run(
+            conn, run_id=run_id, project_id=run.project_id
+        )
+        candidate_git_sha = active_candidate_sha(conn, run_id)
+        if not candidate_git_sha and release_record_id:
+            from projectos.delivery.store import get_delivery_release
+
+            record = get_delivery_release(conn, release_record_id=release_record_id)
+            if record is not None:
+                candidate_git_sha = str(record.get("candidate_git_sha") or "") or None
         evaluation = evaluate_sponsor_outcome(
             conn,
             run_id=run_id,
@@ -364,8 +401,9 @@ def maybe_close_run_after_event(
             objective=run.objective or "",
             request_type=run.request_type,
             release_record_id=release_record_id,
-            candidate_git_sha=active_candidate_sha(conn, run_id),
+            candidate_git_sha=candidate_git_sha,
             project_id=run.project_id,
+            repository_root=repository_root,
         )
         if not evaluation.satisfied:
             emit_projectos_event(

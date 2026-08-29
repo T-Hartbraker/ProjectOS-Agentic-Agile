@@ -141,6 +141,7 @@ def create_remediation_work(
         requires_worktree=queue in {"DELIVERY", "ARCHITECTURE", "INTEGRATION"},
         base_git_sha=source_candidate_id,
         assignment=assignment,
+        run_id=run_id,
     )
     now = utc_now_iso()
     cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(remediation_work)").fetchall()}

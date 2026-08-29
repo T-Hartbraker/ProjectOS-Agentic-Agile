@@ -8,6 +8,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from projectos.errors import OrchestrationError
+
 EVENT_VERSION = 1
 VISIBILITY_LEVELS = frozenset({"INTERNAL", "SPONSOR", "AUDIT"})
 DETAIL_LEVELS = frozenset({"milestone", "normal", "verbose"})
@@ -307,7 +309,9 @@ def lookup_event_context_for_job(
         if row and row["run_id"]:
             run_id = str(row["run_id"])
     if not run_id:
-        return lookup_event_context_for_project(conn, job.project_human_id)
+        raise OrchestrationError(
+            f"Job {job.human_id} lacks run lineage; cannot resolve run-scoped event context"
+        )
     row = conn.execute(
         """
         SELECT h.project_id, h.handoff_id, r.run_id, h.team_id, h.channel_id, h.thread_ts

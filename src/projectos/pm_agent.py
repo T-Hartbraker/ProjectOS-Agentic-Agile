@@ -610,10 +610,18 @@ def _orchestrate_release_capability_impl(
 
     gate = qa_result.gate
     if gate != "PASSED":
+        with connection(ctx.db_path) as liveness_conn:
+            from projectos.run_liveness import assert_nonterminal_run_has_durable_next_action
+
+            action = assert_nonterminal_run_has_durable_next_action(
+                liveness_conn,
+                run_id=event_ctx.run_id or project_id,
+                project_id=project_id,
+            )
         return (
             f"*ProjectOS PM — QA gate `{gate}`*\n"
             f"Run: `{event_ctx.run_id}`\n"
-            "PM is managing remediation; run remains active."
+            f"Next action: {action['state']}"
         )
 
     with connection(ctx.db_path) as prep_conn:

@@ -15,8 +15,8 @@ from projectos.domain_events import (
     EventContext,
     emit_projectos_event,
     lookup_event_context_for_job,
-    lookup_event_context_for_project,
 )
+from projectos.errors import OrchestrationError
 from projectos.store import OrchestrationJob
 
 _ROLE_TO_ACTOR = {
@@ -53,9 +53,10 @@ def emit_worker_cockpit_event(
     visibility: str = "SPONSOR",
     subscribers: tuple[str, ...] = ("slack",),
 ) -> None:
-    base = lookup_event_context_for_job(conn, job.id)
-    if base is None:
-        base = lookup_event_context_for_project(conn, job.project_human_id)
+    try:
+        base = lookup_event_context_for_job(conn, job.id)
+    except OrchestrationError:
+        return
     if base is None:
         return
     ctx = EventContext(

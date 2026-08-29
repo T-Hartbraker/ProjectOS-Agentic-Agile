@@ -271,8 +271,20 @@ def require_sponsor_outcome_satisfied(
     candidate_git_sha: str | None,
     project_id: str | None = None,
     registry_path: Path | str | None = None,
+    repository_root: str | None = None,
 ) -> None:
     from projectos.sponsor_outcome import evaluate_sponsor_outcome
+
+    if not candidate_git_sha and release_record_id:
+        record = get_delivery_release(conn, release_record_id=str(release_record_id))
+        if record is not None:
+            candidate_git_sha = str(record.get("candidate_git_sha") or "") or None
+    if not repository_root and project_id and run_id:
+        from projectos.run_evidence import _repository_root_for_run
+
+        repository_root = _repository_root_for_run(
+            conn, run_id=run_id, project_id=project_id
+        )
 
     evaluation = evaluate_sponsor_outcome(
         conn,
@@ -284,6 +296,7 @@ def require_sponsor_outcome_satisfied(
         candidate_git_sha=candidate_git_sha,
         project_id=project_id,
         registry_path=registry_path,
+        repository_root=repository_root,
     )
     if not evaluation.satisfied:
         raise OrchestrationError(
@@ -374,4 +387,5 @@ def validate_event_truthfulness(
             candidate_git_sha=(evidence or {}).get("candidate_git_sha"),
             project_id=str(run["project_id"]),
             registry_path=registry_path,
+            repository_root=None,
         )
