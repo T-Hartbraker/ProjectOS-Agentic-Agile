@@ -207,7 +207,7 @@ def _apply_active_run_directive(
             event_ctx=thread,
             project_id=project_id,
             repository_root=str(repo_root.resolve()) if repo_root else "/repo",
-            retest_result="pass",
+            service_ctx=ctx,
         )
 
     projectos_text = (
@@ -569,6 +569,7 @@ def orchestrate_release_capability(
             event_ctx=event_ctx,
             project_id=project_id,
             repository_root=str(repo_root.resolve()) if repo_root else "/repo",
+            service_ctx=ctx,
         )
 
     if qa_result.escalated:
@@ -751,6 +752,7 @@ def orchestrate_release_capability(
                 },
                 project_id=project_id,
                 repository_root=str(repo_root.resolve()) if repo_root else "/repo",
+                service_ctx=ctx,
             )
         return (
             f"{evidence_text}\n\n"

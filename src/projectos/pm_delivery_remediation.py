@@ -212,6 +212,8 @@ def handle_capability_gap(
     gap: dict[str, Any],
     project_id: str,
     repository_root: str,
+    service_ctx=None,
+    worker=None,
 ) -> DeliveryRemediationResult:
     """PM routes capability gaps into executable work or authority escalation."""
     recoverability = classify_failure_recoverability(gap)
@@ -300,7 +302,8 @@ def handle_capability_gap(
         event_ctx=event_ctx,
         project_id=project_id,
         repository_root=repository_root,
-        retest_result="pass",
+        service_ctx=service_ctx,
+        worker=worker,
     )
     return DeliveryRemediationResult(
         recovered=False,
