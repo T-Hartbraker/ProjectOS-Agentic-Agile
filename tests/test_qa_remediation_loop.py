@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from fakes.orchestration_fakes import SequencedAssuranceExecutor, make_git_remediation_worker
 from helpers import init_git_repo, write_identity, write_registry
 from projectos.db import connection
 from projectos.domain_events import EventContext
@@ -67,6 +68,8 @@ def _seed_run(conn) -> EventContext:
 
 def test_qa_fail_remediation_pass_continue(tmp_path: Path) -> None:
     ctx, repo_root = _ctx(tmp_path)
+    worker = make_git_remediation_worker(repo_root)
+    assurance = SequencedAssuranceExecutor([True])
     with connection(ctx.db_path) as conn:
         event_ctx = _seed_run(conn)
         _seed_qa(conn, total=4, failed=2, repo_root=repo_root, run_id=event_ctx.run_id)
@@ -84,6 +87,8 @@ def test_qa_fail_remediation_pass_continue(tmp_path: Path) -> None:
             event_ctx=event_ctx,
             project_id="PRJ-003",
             repository_root=repo_root,
+            worker=worker,
+            assurance_executor=assurance,
         )
         events = {
             r["event_type"]
@@ -117,30 +122,20 @@ def test_qa_fail_remediation_pass_continue(tmp_path: Path) -> None:
 
 def test_remediation_policy_exceeded_escalates(tmp_path: Path) -> None:
     ctx, repo_root = _ctx(tmp_path)
+    worker = make_git_remediation_worker(repo_root)
+    assurance = SequencedAssuranceExecutor([False, False, False])
     with connection(ctx.db_path) as conn:
         event_ctx = _seed_run(conn)
         _seed_qa(conn, total=4, failed=4, repo_root=repo_root, run_id=event_ctx.run_id)
-        conn.execute(
-            """
-            INSERT INTO projectos_events (
-                event_id, event_version, project_id, run_id, actor_type, actor_id,
-                actor_role, event_type, summary, visibility, detail_level, evidence_json
-            ) VALUES (lower(hex(randomblob(8))), 1, 'PRJ-003', ?, 'agent', 'qa-agent',
-                      'QA Agent', 'QA_FINDING_CREATED', 'seed', 'SPONSOR', 'normal', ?)
-            """,
-            (
-                event_ctx.run_id,
-                json.dumps({"category": "SOURCE_CODE_DEFECT", "finding_id": "FND-SEED"}),
-            ),
-        )
         result = run_qa_with_remediation(
             conn,
             event_ctx=event_ctx,
             project_id="PRJ-003",
             repository_root=repo_root,
             max_cycles=3,
-            max_same_finding_recurrence=1,
-            retest_passes=False,
+            max_same_finding_recurrence=3,
+            worker=worker,
+            assurance_executor=assurance,
         )
         terminal = conn.execute(
             "SELECT event_type FROM projectos_events WHERE run_id=? AND event_type='RUN_ESCALATED'",
