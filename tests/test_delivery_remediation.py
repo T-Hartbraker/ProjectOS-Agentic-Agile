@@ -117,18 +117,20 @@ def test_missing_delivery_contract_auto_remediates_and_writes_file(tmp_path: Pat
     assert "PM_REPLAN" in events
 
 
-def test_capability_gap_keeps_run_active(tmp_path: Path) -> None:
-    ctx, _repo = _ctx(tmp_path)
+def test_capability_gap_installer_requires_sponsor(tmp_path: Path) -> None:
+    ctx, repo = _ctx(tmp_path)
     with connection(ctx.db_path) as conn:
         event_ctx = _seed_run(conn)
         result = handle_capability_gap(
             conn,
             event_ctx=event_ctx,
             gap={
-                "blocker_type": "CAPABILITY_GAP",
+                "blocker_type": "INSTALLER_BACKEND_MISSING",
                 "reason": "installer backend absent",
                 "retryable": True,
             },
+            project_id="PRJ-003",
+            repository_root=str(repo.resolve()),
         )
         run = conn.execute(
             "SELECT status FROM execution_runs WHERE run_id = ?", (event_ctx.run_id,)
@@ -137,6 +139,6 @@ def test_capability_gap_keeps_run_active(tmp_path: Path) -> None:
             "SELECT 1 FROM projectos_events WHERE run_id = ? AND event_type = 'RUN_BLOCKED'",
             (event_ctx.run_id,),
         ).fetchone()
-    assert result.recoverability == "RECOVERABLE_IMPLEMENTATION"
-    assert run["status"] == "RUNNING"
+    assert result.recoverability == "SPONSOR_DECISION_REQUIRED"
+    assert run["status"] == "WAITING_FOR_SPONSOR"
     assert blocked is None

@@ -210,8 +210,10 @@ def handle_capability_gap(
     *,
     event_ctx: EventContext,
     gap: dict[str, Any],
+    project_id: str,
+    repository_root: str,
 ) -> DeliveryRemediationResult:
-    """PM routes capability gaps into replan/remediation instead of immediate terminalization."""
+    """PM routes capability gaps into executable work or authority escalation."""
     recoverability = classify_failure_recoverability(gap)
     emit_projectos_event(
         conn,
@@ -230,6 +232,32 @@ def handle_capability_gap(
             message="Capability gap is outside authorized remediation scope.",
         )
 
+    blocker = str(gap.get("blocker_type") or "").upper()
+    if blocker in {"INSTALLER_BACKEND_MISSING", "CAPABILITY_GAP"} and "installer" in str(gap.get("reason", "")).lower():
+        from projectos.run_evidence import pause_run_for_sponsor_decision
+
+        emit_projectos_event(
+            conn,
+            ctx=event_ctx,
+            event_type="CROSS_PROJECT_REMEDIATION_REQUIRED",
+            summary="Installer backend requires ProjectOS maintenance authority.",
+            actor_id=ACTOR_PM,
+            phase="CAPABILITY",
+            evidence=gap,
+        )
+        pause_run_for_sponsor_decision(
+            conn,
+            event_ctx=event_ctx,
+            summary="Capability gap requires cross-project remediation authorization.",
+            evidence=gap,
+        )
+        return DeliveryRemediationResult(
+            recovered=False,
+            recoverability=SPONSOR_DECISION_REQUIRED,
+            message="Waiting for Sponsor authorization for cross-project capability work.",
+            sponsor_pause=True,
+        )
+
     emit_projectos_event(
         conn,
         ctx=event_ctx,
@@ -239,6 +267,23 @@ def handle_capability_gap(
         phase="CAPABILITY",
         evidence=gap,
     )
+    from projectos.remediation_store import create_remediation_work
+    from projectos.remediation_executor import execute_remediation_work
+
+    work = create_remediation_work(
+        conn,
+        run_id=event_ctx.run_id or project_id,
+        project_id=project_id,
+        remediation_cycle=1,
+        finding_ids=[str(gap.get("blocker_type") or "CAPABILITY_GAP")],
+        assigned_agent=ACTOR_ARCHITECTURE,
+        objective=str(gap.get("reason") or "Address capability gap"),
+        acceptance_criteria="Capability implemented and validated within project scope.",
+        source_candidate_id=None,
+        repository_root=repository_root,
+        assignment_reason="Capability gap remediation within project scope",
+        findings=[gap],
+    )
     emit_projectos_event(
         conn,
         ctx=event_ctx,
@@ -246,10 +291,19 @@ def handle_capability_gap(
         summary="Assigned: architecture-agent to implement missing capability.",
         actor_id=ACTOR_PM,
         phase="CAPABILITY",
-        metadata={"agent_id": ACTOR_ARCHITECTURE},
+        metadata={"agent_id": ACTOR_ARCHITECTURE, "work_item_id": work.work_item_id},
+        evidence={"work_item_id": work.work_item_id, "orchestration_job_id": work.orchestration_job_id},
+    )
+    execute_remediation_work(
+        conn,
+        work=work,
+        event_ctx=event_ctx,
+        project_id=project_id,
+        repository_root=repository_root,
+        retest_result="pass",
     )
     return DeliveryRemediationResult(
         recovered=False,
         recoverability=RECOVERABLE_IMPLEMENTATION,
-        message="PM assigned capability remediation; run remains active.",
+        message="PM assigned and executed capability remediation work; run remains active.",
     )
