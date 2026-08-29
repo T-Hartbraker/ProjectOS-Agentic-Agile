@@ -2728,6 +2728,8 @@ def update_governance_decision(
     return row
 
 
+# TODO(store-decomposition): Extract Slack persistence into bounded repositories
+# (slack_bindings_repo, slack_message_refs_repo) once orchestration consolidation stabilizes.
 def _slack_binding_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "binding_human_id": str(row["binding_human_id"]),
@@ -2860,138 +2862,6 @@ def list_slack_message_refs_for_project(
         for row in rows
     ]
 
-
-def _slack_binding_row(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "binding_human_id": str(row["binding_human_id"]),
-        "project_human_id": str(row["project_human_id"]),
-        "team_id": str(row["team_id"] or ""),
-        "channel_id": str(row["channel_id"]),
-        "thread_ts": str(row["thread_ts"] or ""),
-        "created_at": str(row["created_at"]),
-        "updated_at": str(row["updated_at"]),
-    }
-
-
-def insert_slack_binding(
-    conn: sqlite3.Connection,
-    *,
-    binding_human_id: str,
-    project_human_id: str,
-    team_id: str,
-    channel_id: str,
-    thread_ts: str,
-) -> dict[str, Any]:
-    now = utc_now_iso()
-    conn.execute(
-        """
-        INSERT INTO slack_bindings (
-            binding_human_id, project_human_id, team_id, channel_id, thread_ts,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (binding_human_id, project_human_id, team_id, channel_id, thread_ts, now, now),
-    )
-    row = get_slack_binding(conn, team_id=team_id, channel_id=channel_id, thread_ts=thread_ts)
-    assert row is not None
-    return row
-
-
-def get_slack_binding(
-    conn: sqlite3.Connection,
-    *,
-    team_id: str,
-    channel_id: str,
-    thread_ts: str,
-) -> dict[str, Any] | None:
-    row = conn.execute(
-        """
-        SELECT * FROM slack_bindings
-        WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
-        """,
-        (team_id, channel_id, thread_ts),
-    ).fetchone()
-    return _slack_binding_row(row) if row else None
-
-
-def list_slack_bindings_for_project(
-    conn: sqlite3.Connection, project_human_id: str
-) -> list[dict[str, Any]]:
-    project = require_safe_id(project_human_id, label="project_human_id")
-    rows = conn.execute(
-        """
-        SELECT * FROM slack_bindings
-        WHERE project_human_id = ?
-        ORDER BY channel_id ASC, thread_ts ASC
-        """,
-        (project,),
-    ).fetchall()
-    return [_slack_binding_row(row) for row in rows]
-
-
-def delete_slack_binding(
-    conn: sqlite3.Connection,
-    *,
-    team_id: str,
-    channel_id: str,
-    thread_ts: str,
-) -> None:
-    conn.execute(
-        """
-        DELETE FROM slack_bindings
-        WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
-        """,
-        (team_id, channel_id, thread_ts),
-    )
-
-
-def insert_slack_message_ref(
-    conn: sqlite3.Connection,
-    *,
-    project_human_id: str,
-    team_id: str,
-    channel_id: str,
-    thread_ts: str,
-    message_ts: str,
-) -> None:
-    now = utc_now_iso()
-    conn.execute(
-        """
-        INSERT INTO slack_message_refs (
-            project_human_id, team_id, channel_id, thread_ts, message_ts, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(team_id, channel_id, message_ts) DO NOTHING
-        """,
-        (project_human_id, team_id, channel_id, thread_ts, message_ts, now),
-    )
-
-
-def list_slack_message_refs_for_project(
-    conn: sqlite3.Connection, project_human_id: str, *, limit: int = 50
-) -> list[dict[str, Any]]:
-    project = require_safe_id(project_human_id, label="project_human_id")
-    cap = max(1, min(int(limit), 200))
-    rows = conn.execute(
-        """
-        SELECT project_human_id, team_id, channel_id, thread_ts, message_ts, created_at
-        FROM slack_message_refs
-        WHERE project_human_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (project, cap),
-    ).fetchall()
-    return [
-        {
-            "project_human_id": str(row["project_human_id"]),
-            "team_id": str(row["team_id"] or "") or None,
-            "channel_id": str(row["channel_id"]),
-            "thread_ts": str(row["thread_ts"] or "") or None,
-            "message_ts": str(row["message_ts"]),
-            "created_at": str(row["created_at"]),
-        }
-        for row in rows
-    ]
 
 def get_slack_intake_item(
     conn: sqlite3.Connection,
