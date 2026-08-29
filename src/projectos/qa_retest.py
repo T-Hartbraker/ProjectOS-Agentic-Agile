@@ -14,7 +14,7 @@ from projectos.constants import ASSURANCE_QUEUES
 from projectos.domain_events import ACTOR_QA, EventContext, emit_projectos_event
 from projectos.errors import OrchestrationError
 from projectos.qa_gate import collect_qa_gate_facts
-from projectos.qa_handoff import create_assurance_jobs_for_delivery, record_assurance_result
+from projectos.qa_handoff import create_assurance_jobs_for_delivery
 from projectos.store import create_job, get_job, get_job_by_human_id, mark_succeeded
 
 
@@ -133,15 +133,10 @@ def _run_assurance_via_worker(
         if job is None:
             raise OrchestrationError(f"Assurance job id={job_id} not found")
         outcome = worker.run_once(job_human_id=job.human_id)
-        if outcome.status != "SUCCEEDED":
-            assurance = get_job(conn, job_id)
-            if assurance is not None:
-                record_assurance_result(
-                    conn,
-                    assurance,
-                    passed=False,
-                    evidence_ref=outcome.message,
-                )
+        if outcome.status != "succeeded":
+            raise OrchestrationError(
+                f"Assurance worker {job.human_id} execution failed: {outcome.message}"
+            )
 
 
 def execute_qa_retest(
@@ -161,6 +156,50 @@ def execute_qa_retest(
     assurance_executor: AssuranceExecutor | None = None,
 ) -> QARetestResult:
     """Run authoritative assurance jobs for a remediation candidate."""
+    from projectos.orchestration_boundary import run_with_internal_defect_routing
+
+    return run_with_internal_defect_routing(
+        conn,
+        event_ctx=event_ctx,
+        project_id=project_id,
+        component="qa_retest",
+        operation="execute_qa_retest",
+        in_project_scope=True,
+        fn=lambda: _execute_qa_retest_impl(
+            conn,
+            event_ctx=event_ctx,
+            project_id=project_id,
+            repository_root=repository_root,
+            candidate_id=candidate_id,
+            candidate_type=candidate_type,
+            run_id=run_id,
+            remediation_cycle=remediation_cycle,
+            retest_roles=retest_roles,
+            source_remediation_job_id=source_remediation_job_id,
+            source_candidate_id=source_candidate_id,
+            service_ctx=service_ctx,
+            assurance_executor=assurance_executor,
+        ),
+    )
+
+
+def _execute_qa_retest_impl(
+    conn: sqlite3.Connection,
+    *,
+    event_ctx: EventContext,
+    project_id: str,
+    repository_root: str,
+    candidate_id: str,
+    candidate_type: str = CANDIDATE_TYPE_GIT_SHA,
+    run_id: str | None,
+    remediation_cycle: int,
+    retest_roles: list[str] | None = None,
+    source_remediation_job_id: int | None = None,
+    source_candidate_id: str | None = None,
+    service_ctx=None,
+    assurance_executor: AssuranceExecutor | None = None,
+) -> QARetestResult:
+    """Internal QA retest execution — wrapped by orchestration boundary."""
     validate_candidate_identity(
         candidate_id,
         candidate_type=candidate_type,

@@ -522,6 +522,32 @@ def orchestrate_release_capability(
     project_id: str,
     handoff: HandoffRequest,
 ) -> str:
+    from projectos.orchestration_boundary import run_with_internal_defect_routing
+
+    with connection(ctx.db_path) as conn:
+        return run_with_internal_defect_routing(
+            conn,
+            event_ctx=event_ctx,
+            project_id=project_id,
+            component="pm_agent",
+            operation="orchestrate_release_capability",
+            in_project_scope=True,
+            fn=lambda: _orchestrate_release_capability_impl(
+                ctx,
+                event_ctx=event_ctx,
+                project_id=project_id,
+                handoff=handoff,
+            ),
+        )
+
+
+def _orchestrate_release_capability_impl(
+    ctx: ServiceContext,
+    *,
+    event_ctx: EventContext,
+    project_id: str,
+    handoff: HandoffRequest,
+) -> str:
     from projectos.delivery.service import DeliveryService
 
     phases = [(name, "pending") for name in RELEASE_PHASES]

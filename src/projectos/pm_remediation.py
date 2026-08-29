@@ -274,6 +274,42 @@ def run_qa_with_remediation(
     assurance_executor: AssuranceExecutor | None = None,
 ) -> RemediationResult:
     """Evaluate QA gate with PM-owned remediation cycles until pass or escalation."""
+    from projectos.orchestration_boundary import run_with_internal_defect_routing
+
+    return run_with_internal_defect_routing(
+        conn,
+        event_ctx=event_ctx,
+        project_id=project_id,
+        component="pm_remediation",
+        operation="run_qa_with_remediation",
+        in_project_scope=True,
+        fn=lambda: _run_qa_with_remediation_impl(
+            conn,
+            event_ctx=event_ctx,
+            project_id=project_id,
+            repository_root=repository_root,
+            max_cycles=max_cycles,
+            max_same_finding_recurrence=max_same_finding_recurrence,
+            worker=worker,
+            service_ctx=service_ctx,
+            assurance_executor=assurance_executor,
+        ),
+    )
+
+
+def _run_qa_with_remediation_impl(
+    conn: sqlite3.Connection,
+    *,
+    event_ctx: EventContext,
+    project_id: str,
+    repository_root: str = "/repo",
+    max_cycles: int = DEFAULT_MAX_REMEDIATION_CYCLES,
+    max_same_finding_recurrence: int = DEFAULT_MAX_SAME_FINDING_RECURRENCE,
+    worker: RemediationWorker | None = None,
+    service_ctx=None,
+    assurance_executor: AssuranceExecutor | None = None,
+) -> RemediationResult:
+    """Internal QA remediation loop — wrapped by orchestration boundary."""
     if not event_ctx.run_id:
         facts = emit_qa_gate_evaluation(conn, project_id=project_id, event_context=event_ctx)
         return RemediationResult(gate=str(facts.get("gate") or "PENDING"), remediation_cycles=0)
@@ -290,6 +326,8 @@ def run_qa_with_remediation(
         )
         gate = str(facts.get("gate") or "PENDING")
         if gate == "PASSED":
+            return RemediationResult(gate=gate, remediation_cycles=cycles, findings=())
+        if gate == "INCONCLUSIVE":
             return RemediationResult(gate=gate, remediation_cycles=cycles, findings=())
         if gate != "FAILED":
             return RemediationResult(gate=gate, remediation_cycles=cycles, findings=())
