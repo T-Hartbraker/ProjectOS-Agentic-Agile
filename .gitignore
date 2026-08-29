@@ -15,15 +15,21 @@ build/
 .env
 .env.*
 
+# Local operator/runtime configuration (not product defaults)
+config/projects.json
+config/operator.json
+tmp_live_forensics.py
+
 # Durable local orchestration runtime (keep directory placeholders only)
 state/*
 !state/.gitkeep
-state/*.db
-state/*.db-shm
-state/*.db-wal
-state/*.pid
-state/*.lock
-state/*.enc
+state/**/*.json
+state/**/*.db
+state/**/*.db-shm
+state/**/*.db-wal
+state/**/*.pid
+state/**/*.lock
+state/**/*.enc
 
 # Run evidence / agent artifacts (FAT evidence stays local, not in Git)
 logs/*
