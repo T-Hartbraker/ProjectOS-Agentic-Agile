@@ -4,11 +4,76 @@ from __future__ import annotations
 
 import sqlite3
 
-from projectos.constants import ASSURANCE_QUEUES, QUEUE_TO_ROLE
+from projectos.constants import ASSURANCE_QUEUES
 from projectos.domain_events import ACTOR_PM, EventContext, emit_projectos_event
 from projectos.errors import OrchestrationError
+from projectos.qa_handoff import create_assurance_retry
 from projectos.run_next_actions import persist_run_next_action
-from projectos.store import create_job, get_job_by_human_id
+
+
+def _inconclusive_roles(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    project_id: str,
+    candidate_git_sha: str,
+    roles: list[str] | None,
+) -> list[tuple[str, int, int | None]]:
+    """Return (queue, producer_job_id, prior_assurance_job_id) for each retry target."""
+
+    def _delivery_producer() -> int | None:
+        row = conn.execute(
+            """
+            SELECT id FROM orchestration_jobs
+            WHERE project_human_id = ?
+              AND candidate_git_sha = ?
+              AND queue = 'DELIVERY'
+              AND status = 'SUCCEEDED'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (project_id, candidate_git_sha),
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+    if roles:
+        target_roles = roles
+        producer = _delivery_producer()
+        if producer is None:
+            return []
+        return [(role, producer, None) for role in target_roles]
+
+    rows = conn.execute(
+        """
+        SELECT assurance_role, delivery_job_id, assurance_job_id
+        FROM qa_evidence
+        WHERE run_id = ? AND candidate_git_sha = ? AND result = 'inconclusive'
+        ORDER BY id ASC
+        """,
+        (run_id, candidate_git_sha),
+    ).fetchall()
+    if rows:
+        resolved: list[tuple[str, int, int | None]] = []
+        fallback_producer = _delivery_producer()
+        for r in rows:
+            producer_id = r["delivery_job_id"]
+            if producer_id is None:
+                producer_id = fallback_producer
+            if producer_id is None:
+                continue
+            resolved.append(
+                (
+                    str(r["assurance_role"]),
+                    int(producer_id),
+                    int(r["assurance_job_id"]) if r["assurance_job_id"] else None,
+                )
+            )
+        if resolved:
+            return resolved
+
+    producer = _delivery_producer()
+    if producer is None:
+        return []
+    return [(role, producer, None) for role in ASSURANCE_QUEUES]
 
 
 def schedule_assurance_retry_for_inconclusive(
@@ -22,25 +87,29 @@ def schedule_assurance_retry_for_inconclusive(
     inconclusive_roles: list[str] | None = None,
 ) -> list[int]:
     """Create READY assurance retry jobs on the same candidate and durable next actions."""
-    roles = inconclusive_roles or list(ASSURANCE_QUEUES)
+    if not candidate_git_sha:
+        raise OrchestrationError("INCONCLUSIVE retry requires candidate_git_sha")
+    targets = _inconclusive_roles(
+        conn,
+        run_id=run_id,
+        project_id=project_id,
+        candidate_git_sha=candidate_git_sha,
+        roles=inconclusive_roles,
+    )
+    if not targets:
+        raise OrchestrationError("No producer lineage found for inconclusive assurance retry")
+
     created_ids: list[int] = []
-    anchor = f"{run_id}__INCONCLUSIVE__{candidate_git_sha[:12]}"
-    for role in roles:
-        human_id = f"{anchor}__{role}__RETRY"
-        existing = get_job_by_human_id(conn, human_id)
-        if existing is not None:
-            if existing.status in {"READY", "LEASED", "RUNNING", "RETRY_WAIT"}:
-                created_ids.append(existing.id)
-            continue
-        job = create_job(
+    for role, producer_job_id, prior_job_id in targets:
+        job = create_assurance_retry(
             conn,
-            human_id=human_id,
-            project_human_id=project_id,
+            run_id=run_id,
+            project_id=project_id,
             repository_root=repository_root,
-            agent_role=QUEUE_TO_ROLE.get(role, role),
-            queue=role,
-            status="READY",
-            base_git_sha=candidate_git_sha,
+            candidate_git_sha=candidate_git_sha,
+            assessor_queue=role,
+            producer_job_id=producer_job_id,
+            prior_assurance_job_id=prior_job_id,
         )
         created_ids.append(job.id)
         persist_run_next_action(
@@ -53,10 +122,9 @@ def schedule_assurance_retry_for_inconclusive(
                 "reason": "qa_inconclusive",
                 "candidate_git_sha": candidate_git_sha,
                 "assurance_role": role,
+                "producer_job_id": producer_job_id,
             },
         )
-    if not created_ids:
-        raise OrchestrationError("No assurance retry jobs could be scheduled for inconclusive QA")
     emit_projectos_event(
         conn,
         ctx=event_ctx,
@@ -67,7 +135,7 @@ def schedule_assurance_retry_for_inconclusive(
         evidence={
             "candidate_git_sha": candidate_git_sha,
             "assurance_job_ids": created_ids,
-            "roles": roles,
+            "roles": [t[0] for t in targets],
         },
     )
     return created_ids

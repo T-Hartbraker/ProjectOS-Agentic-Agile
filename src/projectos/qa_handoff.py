@@ -90,6 +90,7 @@ def create_assurance_jobs_for_delivery(
             worktree_name=f"{delivery.project_human_id}__{human_id}",
             base_git_sha=candidate_git_sha,
             identity_snapshot=identity,
+            run_id=getattr(delivery, "run_id", None),
         )
         set_job_source_provenance(
             conn,
@@ -184,6 +185,104 @@ def create_assurance_jobs_for_producer(
     return create_assurance_jobs_for_delivery(conn, producer, candidate_git_sha=candidate_git_sha)
 
 
+def _next_assurance_retry_attempt(
+    conn,
+    *,
+    run_id: str,
+    candidate_git_sha: str,
+    assessor_queue: str,
+) -> int:
+    pattern = f"{run_id}__{candidate_git_sha[:12]}__{assessor_queue}__RETRY_%"
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM orchestration_jobs
+        WHERE human_id LIKE ? AND queue = ?
+        """,
+        (pattern, assessor_queue),
+    ).fetchone()
+    return int(row["c"]) + 1 if row else 1
+
+
+def create_assurance_retry(
+    conn,
+    *,
+    run_id: str,
+    project_id: str,
+    repository_root: str,
+    candidate_git_sha: str,
+    assessor_queue: str,
+    producer_job_id: int,
+    prior_assurance_job_id: int | None = None,
+    attempt_number: int | None = None,
+) -> OrchestrationJob:
+    """Create a real assurance retry job with candidate/evidence lineage."""
+    producer = get_job(conn, producer_job_id)
+    if producer is None:
+        raise OrchestrationError(f"Producer job {producer_job_id} not found")
+    attempt = attempt_number or _next_assurance_retry_attempt(
+        conn,
+        run_id=run_id,
+        candidate_git_sha=candidate_git_sha,
+        assessor_queue=assessor_queue,
+    )
+    human_id = (
+        f"{run_id}__{candidate_git_sha[:12]}__{assessor_queue}__RETRY_{attempt:03d}"
+    )
+    existing = conn.execute(
+        "SELECT id FROM orchestration_jobs WHERE human_id = ?",
+        (human_id,),
+    ).fetchone()
+    if existing is not None:
+        return get_job(conn, int(existing["id"]))
+    identity = None
+    if producer.identity_snapshot_json:
+        try:
+            identity = json.loads(producer.identity_snapshot_json)
+        except json.JSONDecodeError:
+            identity = None
+    if identity is None:
+        identity = {
+            "project_human_id": project_id,
+            "repository_root": repository_root,
+        }
+    job = create_job(
+        conn,
+        human_id=human_id,
+        project_human_id=project_id,
+        repository_root=repository_root,
+        agent_role=QUEUE_TO_ROLE[assessor_queue],
+        queue=assessor_queue,
+        status="READY",
+        requires_worktree=True,
+        worktree_name=f"{project_id}__{human_id}",
+        base_git_sha=candidate_git_sha,
+        identity_snapshot=identity,
+        run_id=run_id,
+    )
+    set_job_source_provenance(
+        conn,
+        job.id,
+        source_delivery_job_id=producer_job_id,
+        source_candidate_sha=candidate_git_sha,
+    )
+    if prior_assurance_job_id is not None:
+        add_job_dependency(conn, job.id, prior_assurance_job_id)
+    insert_qa_evidence(
+        conn,
+        project_human_id=project_id,
+        repository_root=repository_root,
+        delivery_job_id=producer_job_id,
+        assurance_job_id=job.id,
+        candidate_git_sha=candidate_git_sha,
+        assurance_role=assessor_queue,
+        result="pending",
+        run_id=run_id,
+        attempt_number=attempt,
+        prior_assurance_job_id=prior_assurance_job_id,
+    )
+    return job
+
+
 def _assert_assurance_recording_allowed(assurance: OrchestrationJob) -> str:
     if (
         assurance.queue not in ASSURANCE_QUEUES
@@ -247,7 +346,7 @@ def record_invalid_assurance_result(
     except OrchestrationError:
         raise
 
-    from projectos.domain_events import lookup_event_context_for_project
+    from projectos.domain_events import lookup_event_context_for_job
     from projectos.qa_evidence_policy import update_qa_evidence_result
     from projectos.qa_gate import emit_qa_gate_evaluation
 
@@ -266,7 +365,7 @@ def record_invalid_assurance_result(
         message=reason[:500],
         payload={"reason": reason, "candidate_git_sha": expected},
     )
-    event_ctx = lookup_event_context_for_project(conn, assurance.project_human_id)
+    event_ctx = lookup_event_context_for_job(conn, assurance.id)
     if event_ctx is not None:
         from projectos.domain_events import ACTOR_QA, emit_projectos_event
 
@@ -342,10 +441,10 @@ def record_assurance_verdict(
         },
     )
 
-    from projectos.domain_events import lookup_event_context_for_project
+    from projectos.domain_events import lookup_event_context_for_job
     from projectos.qa_gate import emit_qa_finding_created, emit_qa_gate_evaluation
 
-    event_ctx = lookup_event_context_for_project(conn, assurance.project_human_id)
+    event_ctx = lookup_event_context_for_job(conn, assurance.id)
     if event_ctx is not None:
         from projectos.domain_events import ACTOR_QA, emit_projectos_event
 
