@@ -365,6 +365,7 @@ def maybe_close_run_after_event(
             request_type=run.request_type,
             release_record_id=release_record_id,
             candidate_git_sha=active_candidate_sha(conn, run_id),
+            project_id=run.project_id,
         )
         if not evaluation.satisfied:
             emit_projectos_event(

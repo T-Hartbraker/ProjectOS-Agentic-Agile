@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from projectos.acceptance_contract import (
@@ -11,7 +12,7 @@ from projectos.acceptance_contract import (
     build_acceptance_contract,
     evaluate_effective_requirements,
 )
-from projectos.delivery.contract import load_delivery_contract
+from projectos.delivery_policy import resolve_delivery_policy
 from projectos.execution_run import get_execution_run
 
 
@@ -35,17 +36,45 @@ def evaluate_sponsor_outcome(
     release_record_id: str | None = None,
     candidate_git_sha: str | None = None,
     repository_root: str | None = None,
+    project_id: str | None = None,
+    registry_path: Path | str | None = None,
 ) -> SponsorOutcomeEvaluation:
     run = get_execution_run(conn, run_id)
     resolved_request_type = request_type or (run.request_type if run else "") or ""
-    contract_obj = None
-    if repository_root:
-        try:
-            from pathlib import Path
+    resolved_project_id = project_id or (run.project_id if run else "") or ""
 
-            contract_obj = load_delivery_contract(Path(repository_root))
-        except Exception:
-            contract_obj = None
+    contract_obj = None
+    policy_error: str | None = None
+    resolved_repo_root = repository_root
+
+    if str(resolved_request_type).upper() == "RELEASE":
+        if repository_root:
+            try:
+                from projectos.delivery.contract import load_delivery_contract
+
+                contract_obj = load_delivery_contract(Path(repository_root))
+                resolved_repo_root = repository_root
+            except Exception as exc:
+                policy_error = f"DELIVERY_POLICY_UNAVAILABLE: {exc}"
+        elif resolved_project_id:
+            contract_obj, resolved_repo_root, policy_error = resolve_delivery_policy(
+                conn,
+                project_id=resolved_project_id,
+                registry_path=registry_path,
+            )
+        else:
+            policy_error = "DELIVERY_POLICY_UNAVAILABLE: missing project_id"
+
+        if policy_error or contract_obj is None:
+            return SponsorOutcomeEvaluation(
+                satisfied=False,
+                required_outputs=["delivery_policy"],
+                missing_outputs=["delivery_policy"],
+                evidence_refs={
+                    "invalid_reason": policy_error or "DELIVERY_POLICY_UNAVAILABLE",
+                    "project_id": resolved_project_id,
+                },
+            )
 
     acceptance = build_acceptance_contract(
         conn,
@@ -91,6 +120,8 @@ def evaluate_sponsor_outcome(
         candidate_git_sha=candidate_git_sha,
         contract_obj=contract_obj,
     )
+    if resolved_repo_root:
+        evidence["repository_root"] = resolved_repo_root
     return SponsorOutcomeEvaluation(
         satisfied=satisfied,
         required_outputs=required,
