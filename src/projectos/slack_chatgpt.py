@@ -422,15 +422,33 @@ def _build_authoritative_context(
     sponsor_user_id: str,
     extra_facts: str = "",
 ) -> str:
-    sponsor_ctx = build_sponsor_context(
-        ctx,
-        conn,
-        project_id=project_id,
-        team_id=team_id,
-        channel_id=channel_id,
-        thread_key=thread_key,
-        sponsor_user_id=sponsor_user_id,
-    )
+    from projectos.domain_events import lookup_event_context_for_project
+    from projectos.orchestration_boundary import run_with_internal_defect_routing
+
+    event_ctx = lookup_event_context_for_project(conn, project_id)
+
+    def _build():
+        return build_sponsor_context(
+            ctx,
+            conn,
+            project_id=project_id,
+            team_id=team_id,
+            channel_id=channel_id,
+            thread_key=thread_key,
+            sponsor_user_id=sponsor_user_id,
+        )
+
+    if event_ctx is not None:
+        sponsor_ctx = run_with_internal_defect_routing(
+            conn,
+            event_ctx=event_ctx,
+            project_id=project_id,
+            component="slack_sponsor_context",
+            operation="build_sponsor_context",
+            fn=_build,
+        )
+    else:
+        sponsor_ctx = _build()
     lines = [sponsor_ctx.to_model_text()]
     if extra_facts.strip():
         lines.append("")

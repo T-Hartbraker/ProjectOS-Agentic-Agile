@@ -20,6 +20,9 @@ def handle_internal_defect(
     operation: str,
     project_id: str,
     in_project_scope: bool = False,
+    service_ctx=None,
+    worker=None,
+    repository_root: str | None = None,
 ) -> dict[str, Any]:
     """Route internal software defects to structured PM work or authority escalation."""
     evidence: dict[str, Any] = {
@@ -43,13 +46,14 @@ def handle_internal_defect(
         evidence=evidence,
     )
     if in_project_scope:
+        from projectos.remediation_executor import execute_remediation_work
         from projectos.remediation_store import create_remediation_work
         from projectos.registry import load_registry
         from projectos.paths import DEFAULT_REGISTRY_PATH
 
         registry = load_registry(DEFAULT_REGISTRY_PATH)
         entry = registry.get(project_id)
-        repo_root = str(entry.repository_root) if entry else ""
+        repo_root = repository_root or (str(entry.repository_root) if entry else "")
         work = create_remediation_work(
             conn,
             run_id=event_ctx.run_id or project_id,
@@ -65,6 +69,15 @@ def handle_internal_defect(
             findings=[evidence],
         )
         evidence["remediation_work_item_id"] = work.work_item_id
+        execute_remediation_work(
+            conn,
+            work=work,
+            event_ctx=event_ctx,
+            project_id=project_id,
+            repository_root=repo_root or "/",
+            service_ctx=service_ctx,
+            worker=worker,
+        )
         return evidence
 
     emit_projectos_event(
