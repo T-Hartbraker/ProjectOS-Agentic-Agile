@@ -39,6 +39,7 @@ def collect_qa_gate_facts(
     passed = []
     failed = []
     pending = []
+    inconclusive = []
     for r in rows:
         result = str(r["result"] or "")
         job_status = str(r["job_status"] or "")
@@ -46,6 +47,8 @@ def collect_qa_gate_facts(
             failed.append(r)
         elif result == "pass":
             passed.append(r)
+        elif result == "inconclusive":
+            inconclusive.append(r)
         elif result == "pending" or job_status in {"READY", "QUEUED", "LEASED", "RUNNING"}:
             pending.append(r)
         elif job_status in {"FAILED", "BLOCKED"}:
@@ -54,18 +57,21 @@ def collect_qa_gate_facts(
             pending.append(r)
     if failed:
         gate = "FAILED"
+    elif inconclusive:
+        gate = "INCONCLUSIVE"
     elif reviews_total and not pending and len(passed) == reviews_total:
         gate = "PASSED"
     elif pending:
         gate = "PENDING"
     else:
-        gate = "PASSED" if reviews_total == 0 else "PENDING"
+        gate = "PENDING"
 
     facts: dict[str, Any] = {
         "reviews_total": reviews_total if reviews_total else None,
         "reviews_completed": len(passed) if reviews_total else None,
         "reviews_need_attention": len(failed) if reviews_total else None,
         "reviews_pending": len(pending) if reviews_total else None,
+        "reviews_inconclusive": len(inconclusive) if reviews_total else None,
         "gate": gate,
         "candidate_git_sha": candidate_git_sha,
         "run_id": run_id,
@@ -154,6 +160,18 @@ def emit_qa_gate_evaluation(
             from projectos.errors import OrchestrationError
 
             raise OrchestrationError("QA gate failed; release cannot proceed")
+    elif gate == "INCONCLUSIVE":
+        emit_projectos_event(
+            conn,
+            ctx=event_context,
+            event_type="QA_INCONCLUSIVE",
+            summary="QA gate inconclusive — valid assurance verdict could not be established.",
+            actor_id=ACTOR_QA,
+            phase="QA_GATE",
+            status="BLOCKED",
+            detail_level="milestone",
+            evidence=facts,
+        )
     return facts
 
 
