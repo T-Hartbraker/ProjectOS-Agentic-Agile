@@ -11,8 +11,13 @@ function Assert-ExitCode {
     }
 }
 
-Set-Location C:\Dev\ProjectOS
-. .\.venv\Scripts\Activate.ps1
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $RepoRoot
+
+$VenvActivate = Join-Path $RepoRoot ".venv\Scripts\Activate.ps1"
+if (Test-Path $VenvActivate) {
+    . $VenvActivate
+}
 
 Write-Host "=== ProjectOS full Python test suite ==="
 pytest -q
@@ -27,7 +32,7 @@ python -m projectos doctor
 Assert-ExitCode "ProjectOS doctor"
 
 Write-Host "=== Dashboard tests ==="
-Set-Location C:\Dev\ProjectOS\web
+Set-Location (Join-Path $RepoRoot "web")
 npm test --if-present
 Assert-ExitCode "ProjectOS web tests"
 
@@ -35,8 +40,7 @@ Write-Host "=== Dashboard production build ==="
 npm run build
 Assert-ExitCode "ProjectOS web build"
 
-Set-Location C:\Dev\ProjectOS
+Set-Location $RepoRoot
 
 Write-Host ""
-Write-Host "PROJECT OS PHASE 3 VERIFICATION PASS"
-exit 0
+Write-Host "Phase 3 verification complete."

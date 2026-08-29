@@ -52,7 +52,10 @@ def test_no_forbidden_absolute_paths_in_product_source() -> None:
     violations: list[str] = []
     for path in _git_tracked_files():
         normalized = path.replace("\\", "/")
-        if not normalized.startswith("src/"):
+        if not (
+            normalized.startswith("src/")
+            or normalized.startswith("scripts/")
+        ):
             continue
         if any(normalized.startswith(prefix) for prefix in ALLOWED_PATH_PREFIXES):
             continue
