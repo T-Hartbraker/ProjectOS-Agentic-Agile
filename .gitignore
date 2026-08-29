@@ -1,18 +1,39 @@
-﻿.venv/
+﻿# Virtualenvs and Python caches
+.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Secrets / local env
 .env
 .env.*
+
+# Durable local orchestration runtime (keep directory placeholders only)
+state/*
+!state/.gitkeep
 state/*.db
 state/*.db-shm
 state/*.db-wal
 state/*.pid
 state/*.lock
+
+# Run evidence / agent artifacts (FAT evidence stays local, not in Git)
 logs/*
 !logs/.gitkeep
+
+# Ad-hoc local inspection scripts
+_inspect*.py
+_cursor_adapter_new.py
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
