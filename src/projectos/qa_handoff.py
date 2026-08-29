@@ -166,6 +166,24 @@ def create_assurance_jobs_for_delivery(
     )
 
 
+def create_assurance_jobs_for_producer(
+    conn,
+    producer: OrchestrationJob,
+    *,
+    candidate_git_sha: str,
+) -> HandoffResult:
+    """Create assurance jobs for a real succeeded producer job (delivery or remediation)."""
+    if producer.status != "SUCCEEDED":
+        raise OrchestrationError(
+            f"QA handoff refused: producer job {producer.human_id} is not SUCCEEDED"
+        )
+    if not producer.candidate_git_sha or producer.candidate_git_sha != candidate_git_sha:
+        raise OrchestrationError(
+            "QA handoff refused: producer candidate does not match requested candidate"
+        )
+    return create_assurance_jobs_for_delivery(conn, producer, candidate_git_sha=candidate_git_sha)
+
+
 def _assert_assurance_recording_allowed(assurance: OrchestrationJob) -> str:
     if (
         assurance.queue not in ASSURANCE_QUEUES

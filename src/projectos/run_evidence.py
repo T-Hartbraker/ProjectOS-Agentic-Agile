@@ -92,16 +92,24 @@ def build_terminal_evidence(conn: sqlite3.Connection, *, run_id: str) -> dict[st
     publication_url = None
     row = conn.execute(
         """
-        SELECT release_id, artifact_id, metadata_json
+        SELECT release_id, release_record_id, artifact_id, metadata_json
         FROM projectos_events
-        WHERE run_id = ? AND release_id IS NOT NULL
+        WHERE run_id = ? AND (release_id IS NOT NULL OR release_record_id IS NOT NULL)
         ORDER BY occurred_at DESC LIMIT 1
         """,
         (run_id,),
     ).fetchone()
     if row:
         release_id = row["release_id"]
-        release_record_id = row["artifact_id"]
+        release_record_id = row["release_record_id"]
+        if not release_record_id and row["metadata_json"]:
+            try:
+                meta = json.loads(str(row["metadata_json"]))
+                release_record_id = meta.get("release_record_id")
+            except json.JSONDecodeError:
+                pass
+        if not release_record_id:
+            release_record_id = row["artifact_id"]
 
     if release_record_id:
         rel = conn.execute(
@@ -348,12 +356,14 @@ def maybe_close_run_after_event(
             return
         from projectos.sponsor_outcome import evaluate_sponsor_outcome
 
+        release_record_id = release_record_id_from_event(conn, run_id)
         evaluation = evaluate_sponsor_outcome(
             conn,
             run_id=run_id,
             handoff_id=run.handoff_id,
             objective=run.objective or "",
-            release_record_id=release_record_id_from_event(conn, run_id),
+            request_type=run.request_type,
+            release_record_id=release_record_id,
             candidate_git_sha=active_candidate_sha(conn, run_id),
         )
         if not evaluation.satisfied:
@@ -374,7 +384,12 @@ def maybe_close_run_after_event(
             return
         close_execution_run(
             conn,
-            event_ctx=event_ctx,
+            event_ctx=EventContext(
+                project_id=event_ctx.project_id,
+                handoff_id=event_ctx.handoff_id,
+                run_id=event_ctx.run_id,
+                release_record_id=release_record_id,
+            ),
             outcome=OUTCOME_SUCCESS,
             summary="Sponsor-requested outcomes verified.",
         )
@@ -383,13 +398,33 @@ def maybe_close_run_after_event(
 def release_record_id_from_event(conn: sqlite3.Connection, run_id: str) -> str | None:
     row = conn.execute(
         """
-        SELECT artifact_id FROM projectos_events
-        WHERE run_id = ? AND release_id IS NOT NULL
+        SELECT release_record_id, evidence_json, event_type
+        FROM projectos_events
+        WHERE run_id = ?
+          AND (
+            release_record_id IS NOT NULL
+            OR event_type IN (
+                'RELEASE_PUBLISHED', 'RELEASE_PREPARED', 'PACKAGE_COMPLETED',
+                'RELEASE_VERIFIED', 'SOURCE_GATE_PASSED'
+            )
+          )
         ORDER BY occurred_at DESC LIMIT 1
         """,
         (run_id,),
     ).fetchone()
-    return str(row["artifact_id"]) if row and row["artifact_id"] else None
+    if not row:
+        return None
+    if row["release_record_id"]:
+        return str(row["release_record_id"])
+    if row["evidence_json"]:
+        try:
+            evidence = json.loads(str(row["evidence_json"]))
+            rid = evidence.get("release_record_id")
+            if rid:
+                return str(rid)
+        except json.JSONDecodeError:
+            pass
+    return None
 
 
 def active_candidate_sha(conn: sqlite3.Connection, run_id: str) -> str | None:

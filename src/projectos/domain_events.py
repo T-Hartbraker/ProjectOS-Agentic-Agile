@@ -45,6 +45,7 @@ class EventContext:
     job_id: str | None = None
     work_item_id: str | None = None
     release_id: str | None = None
+    release_record_id: str | None = None
     artifact_id: str | None = None
     correlation_id: str | None = None
     causation_id: str | None = None
@@ -88,6 +89,15 @@ def emit_projectos_event(
     subscribers: tuple[str, ...] = ("slack",),
 ) -> ProjectOSEvent:
     """Persist canonical event and subscriber outbox rows in the caller's transaction."""
+    from projectos.event_truthfulness import validate_event_truthfulness
+
+    validate_event_truthfulness(
+        conn,
+        event_type=event_type,
+        ctx=ctx,
+        evidence=evidence,
+        metadata=metadata,
+    )
     event_id = _new_event_id()
     role = actor_role or ACTOR_ROLE_LABELS.get(actor_id, actor_id)
     merged_meta: dict[str, Any] = {}
@@ -106,11 +116,11 @@ def emit_projectos_event(
         """
         INSERT INTO projectos_events (
             event_id, event_version, project_id, handoff_id, run_id, iteration_id,
-            job_id, work_item_id, release_id, artifact_id,
+            job_id, work_item_id, release_id, release_record_id, artifact_id,
             actor_type, actor_id, actor_role, event_type, phase, status, severity,
             progress, summary, detail, evidence_json, metadata_json,
             visibility, detail_level, correlation_id, causation_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             event_id,
@@ -122,6 +132,7 @@ def emit_projectos_event(
             ctx.job_id,
             ctx.work_item_id,
             ctx.release_id,
+            ctx.release_record_id,
             ctx.artifact_id,
             actor_type,
             actor_id,

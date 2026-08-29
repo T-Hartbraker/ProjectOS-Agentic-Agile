@@ -39,7 +39,7 @@ def emit_source_gate_passed(
         return
     emit_projectos_event(
         conn,
-        ctx=replace(ctx, release_id=release_human_id, artifact_id=release_record_id),
+        ctx=replace(ctx, release_id=release_human_id, release_record_id=release_record_id),
         event_type="SOURCE_GATE_PASSED",
         summary="Source gate passed.",
         actor_id=ACTOR_DELIVERY,
@@ -62,7 +62,7 @@ def emit_release_prepared(
     ctx = _ctx_or_lookup(conn, project_id, event_context)
     if ctx is None:
         return
-    ctx = replace(ctx, release_id=release_human_id, artifact_id=release_record_id)
+    ctx = replace(ctx, release_id=release_human_id, release_record_id=release_record_id)
     emit_projectos_event(
         conn,
         ctx=ctx,
@@ -251,7 +251,7 @@ def emit_publication_started(
         return
     emit_projectos_event(
         conn,
-        ctx=replace(ctx, release_id=release_human_id, artifact_id=release_record_id),
+        ctx=replace(ctx, release_id=release_human_id, release_record_id=release_record_id),
         event_type="PUBLICATION_STARTED",
         summary="Publication started.",
         actor_id=ACTOR_RELEASE,
@@ -300,7 +300,7 @@ def emit_release_published(
         return
     emit_projectos_event(
         conn,
-        ctx=replace(ctx, release_id=release_human_id),
+        ctx=replace(ctx, release_id=release_human_id, release_record_id=release_record_id),
         event_type="RELEASE_PUBLISHED",
         summary=f"Release published: {release_human_id}",
         actor_id=ACTOR_RELEASE,

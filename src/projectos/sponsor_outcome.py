@@ -6,9 +6,13 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
-from projectos.delivery.gates import GATE_STATUS_PASSED
-from projectos.delivery.store import get_delivery_release, list_delivery_artifacts, list_gate_statuses
-from projectos.run_evidence import _handoff_desired_outputs
+from projectos.acceptance_contract import (
+    AcceptanceContract,
+    build_acceptance_contract,
+    evaluate_effective_requirements,
+)
+from projectos.delivery.contract import load_delivery_contract
+from projectos.execution_run import get_execution_run
 
 
 @dataclass
@@ -18,14 +22,7 @@ class SponsorOutcomeEvaluation:
     satisfied_outputs: list[str] = field(default_factory=list)
     missing_outputs: list[str] = field(default_factory=list)
     evidence_refs: dict[str, Any] = field(default_factory=dict)
-
-
-def _artifact_map(conn: sqlite3.Connection, release_record_id: str) -> dict[str, list[dict[str, Any]]]:
-    rows = list_delivery_artifacts(conn, release_record_id)
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        grouped.setdefault(str(row["artifact_type"]), []).append(dict(row))
-    return grouped
+    acceptance_contract: AcceptanceContract | None = None
 
 
 def evaluate_sponsor_outcome(
@@ -34,113 +31,71 @@ def evaluate_sponsor_outcome(
     run_id: str,
     handoff_id: str | None,
     objective: str,
+    request_type: str | None = None,
     release_record_id: str | None = None,
     candidate_git_sha: str | None = None,
+    repository_root: str | None = None,
 ) -> SponsorOutcomeEvaluation:
-    desired = _handoff_desired_outputs(conn, handoff_id)
-    required: list[str] = []
-    satisfied: list[str] = []
-    missing: list[str] = []
-    evidence: dict[str, Any] = {"desired_outputs": desired}
+    run = get_execution_run(conn, run_id)
+    resolved_request_type = request_type or (run.request_type if run else "") or ""
+    contract_obj = None
+    if repository_root:
+        try:
+            from pathlib import Path
 
-    def _require(name: str, ok: bool, ref: Any = None) -> None:
-        required.append(name)
-        if ok:
-            satisfied.append(name)
-            if ref is not None:
-                evidence[name] = ref
-        else:
-            missing.append(name)
+            contract_obj = load_delivery_contract(Path(repository_root))
+        except Exception:
+            contract_obj = None
 
-    record = None
-    if release_record_id:
-        record = get_delivery_release(conn, release_record_id=release_record_id)
-    artifacts: dict[str, list[dict[str, Any]]] = {}
-    gates: dict[str, str] = {}
-    if record is not None:
-        artifacts = _artifact_map(conn, str(record["release_record_id"]))
-        gates = list_gate_statuses(conn, str(record["release_record_id"]))
-        evidence["release_record_id"] = record["release_record_id"]
-        evidence["release_candidate_sha"] = record.get("candidate_git_sha")
+    acceptance = build_acceptance_contract(
+        conn,
+        handoff_id=handoff_id,
+        request_type=resolved_request_type,
+        objective=objective,
+        contract=contract_obj,
+    )
 
-    wants_package = bool(desired.get("package") or desired.get("artifact"))
-    wants_installer = bool(desired.get("installer"))
-    wants_publish = bool(desired.get("publish") or desired.get("download_link") or desired.get("return_download_link"))
-    wants_signed = bool(desired.get("signed") or desired.get("signature"))
-    wants_sbom = bool(desired.get("sbom"))
-    wants_checksum = bool(desired.get("checksum"))
-
-    if not desired:
-        wants_package = "release" in objective.lower() or "package" in objective.lower()
-        wants_publish = any(w in objective.lower() for w in ("publish", "download", "github"))
-
-    if candidate_git_sha and record is not None:
-        _require(
-            "candidate_provenance",
-            str(record.get("candidate_git_sha") or "") == candidate_git_sha,
-            {"expected": candidate_git_sha, "actual": record.get("candidate_git_sha")},
+    if release_record_id is None:
+        if str(resolved_request_type).upper() == "RELEASE":
+            return SponsorOutcomeEvaluation(
+                satisfied=False,
+                required_outputs=acceptance.effective_requirements,
+                missing_outputs=acceptance.effective_requirements or ["release_record"],
+                evidence_refs={
+                    "invalid_reason": acceptance.invalid_reason or "missing_release_record",
+                    "acceptance_contract": acceptance.effective_requirements,
+                },
+                acceptance_contract=acceptance,
+            )
+        if acceptance.invalid:
+            return SponsorOutcomeEvaluation(
+                satisfied=False,
+                required_outputs=acceptance.effective_requirements,
+                missing_outputs=["acceptance_contract"],
+                evidence_refs={"invalid_reason": acceptance.invalid_reason},
+                acceptance_contract=acceptance,
+            )
+        return SponsorOutcomeEvaluation(
+            satisfied=True,
+            required_outputs=[],
+            satisfied_outputs=[],
+            missing_outputs=[],
+            evidence_refs={"note": "non_release_run_without_release_record"},
+            acceptance_contract=acceptance,
         )
 
-    if wants_package:
-        pkg_ok = bool(artifacts.get("zip") or artifacts.get("package") or artifacts.get("installer") or artifacts.get("installer_placeholder"))
-        _require("package", pkg_ok, [a.get("artifact_id") for a in sum(artifacts.values(), [])])
-
-    if wants_installer:
-        installers = artifacts.get("installer") or []
-        placeholders = artifacts.get("installer_placeholder") or []
-        _require("installer", bool(installers) and not placeholders, installers)
-
-    if wants_checksum:
-        arts = sum(artifacts.values(), [])
-        _require(
-            "checksum",
-            all(a.get("sha256") for a in arts) and gates.get("CHECKSUM_GATE") == GATE_STATUS_PASSED,
-            gates.get("CHECKSUM_GATE"),
-        )
-
-    if wants_sbom:
-        _require(
-            "sbom",
-            bool(artifacts.get("sbom")) and gates.get("SBOM_GATE") in {GATE_STATUS_PASSED, "not_required"},
-            artifacts.get("sbom"),
-        )
-
-    if wants_signed:
-        arts = sum(artifacts.values(), [])
-        all_signed = all(str(a.get("signature_status") or "") in {"signed", "not_required"} for a in arts)
-        sig_gate = gates.get("SIGNATURE_GATE")
-        _require(
-            "signature",
-            all_signed and sig_gate == GATE_STATUS_PASSED,
-            {"gate": sig_gate, "artifacts": [a.get("signature_status") for a in arts]},
-        )
-
-    if wants_publish:
-        pub_status = str(record.get("publication_status") or "") if record else ""
-        url = str(record.get("github_release_url") or record.get("download_url") or "") if record else ""
-        _require(
-            "publication",
-            pub_status == "published" and bool(url),
-            {"publication_status": pub_status, "url": url},
-        )
-    elif record is not None and not wants_publish:
-        _require(
-            "local_release",
-            str(record.get("lifecycle_status") or "") in {"packaged", "verified", "local_complete", "released"},
-            record.get("lifecycle_status"),
-        )
-
-    if gates:
-        _require(
-            "qa_gate",
-            gates.get("QA_GATE") == GATE_STATUS_PASSED,
-            gates.get("QA_GATE"),
-        )
-
+    satisfied, required, ok, missing, evidence = evaluate_effective_requirements(
+        conn,
+        contract=acceptance,
+        release_record_id=release_record_id,
+        candidate_git_sha=candidate_git_sha,
+        contract_obj=contract_obj,
+    )
     return SponsorOutcomeEvaluation(
-        satisfied=not missing,
+        satisfied=satisfied,
         required_outputs=required,
-        satisfied_outputs=satisfied,
+        satisfied_outputs=ok,
         missing_outputs=missing,
         evidence_refs=evidence,
+        acceptance_contract=acceptance,
     )

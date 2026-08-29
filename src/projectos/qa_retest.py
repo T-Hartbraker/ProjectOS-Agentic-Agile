@@ -14,8 +14,8 @@ from projectos.constants import ASSURANCE_QUEUES
 from projectos.domain_events import ACTOR_QA, EventContext, emit_projectos_event
 from projectos.errors import OrchestrationError
 from projectos.qa_gate import collect_qa_gate_facts
-from projectos.qa_handoff import create_assurance_jobs_for_delivery
-from projectos.store import create_job, get_job, get_job_by_human_id, mark_succeeded
+from projectos.qa_handoff import create_assurance_jobs_for_producer
+from projectos.store import get_job, get_job_by_human_id
 
 
 class AssuranceExecutor(Protocol):
@@ -42,59 +42,26 @@ class QARetestResult:
     unavailable: bool = False
 
 
-def _ensure_remediation_delivery_job(
+def _resolve_producer_job(
     conn: sqlite3.Connection,
     *,
-    project_id: str,
-    repository_root: str,
-    run_id: str,
-    remediation_cycle: int,
+    source_remediation_job_id: int | None,
     candidate_id: str,
-    source_job_id: int | None,
-    source_candidate_id: str | None = None,
-) -> int:
-    base_sha = source_candidate_id
-    if source_job_id is not None:
-        source = get_job(conn, source_job_id)
-        if source is not None:
-            base_sha = source.base_git_sha or source.candidate_git_sha or base_sha
-            if source.candidate_git_sha == candidate_id:
-                if source.status != "SUCCEEDED":
-                    mark_succeeded(
-                        conn,
-                        source.id,
-                        output_ref="remediation-complete",
-                        candidate_git_sha=candidate_id,
-                    )
-                return source.id
-    row = conn.execute(
-        """
-        SELECT id FROM orchestration_jobs
-        WHERE project_human_id = ? AND human_id = ?
-        """,
-        (project_id, f"{run_id}__REMEDIATION_DELIVERY__c{remediation_cycle}"),
-    ).fetchone()
-    if row:
-        delivery_id = int(row["id"])
-        mark_succeeded(
-            conn,
-            delivery_id,
-            output_ref="remediation-complete",
-            candidate_git_sha=candidate_id,
+) -> Any:
+    if source_remediation_job_id is None:
+        raise OrchestrationError("QA retest requires producer remediation job id")
+    producer = get_job(conn, source_remediation_job_id)
+    if producer is None:
+        raise OrchestrationError(f"Producer job id={source_remediation_job_id} not found")
+    if producer.status != "SUCCEEDED":
+        raise OrchestrationError(
+            f"Producer job {producer.human_id} must be SUCCEEDED before QA retest"
         )
-        return delivery_id
-    delivery = create_job(
-        conn,
-        human_id=f"{run_id}__REMEDIATION_DELIVERY__c{remediation_cycle}",
-        project_human_id=project_id,
-        repository_root=repository_root,
-        agent_role="DELIVERY",
-        queue="DELIVERY",
-        status="SUCCEEDED",
-        base_git_sha=base_sha or candidate_id,
-        candidate_git_sha=candidate_id,
-    )
-    return delivery.id
+    if str(producer.candidate_git_sha or "") != candidate_id:
+        raise OrchestrationError(
+            f"Producer candidate {producer.candidate_git_sha!r} != retest candidate {candidate_id!r}"
+        )
+    return producer
 
 
 def _tag_evidence_run(
@@ -257,23 +224,17 @@ def _execute_qa_retest_impl(
         },
     )
 
-    delivery_id = _ensure_remediation_delivery_job(
+    producer = _resolve_producer_job(
         conn,
-        project_id=project_id,
-        repository_root=repository_root,
-        run_id=run_id or project_id,
-        remediation_cycle=remediation_cycle,
+        source_remediation_job_id=source_remediation_job_id,
         candidate_id=candidate_id,
-        source_job_id=source_remediation_job_id,
-        source_candidate_id=source_candidate_id,
     )
-    delivery = get_job(conn, delivery_id)
-    if delivery is None:
-        raise OrchestrationError(f"Remediation delivery job id={delivery_id} missing")
+    new_candidate = bool(source_candidate_id and source_candidate_id != candidate_id)
+    effective_retest_roles = None if new_candidate else retest_roles
 
-    handoff = create_assurance_jobs_for_delivery(
+    handoff = create_assurance_jobs_for_producer(
         conn,
-        delivery,
+        producer,
         candidate_git_sha=candidate_id,
     )
     assurance_ids = []
@@ -305,7 +266,7 @@ def _execute_qa_retest_impl(
             conn,
             service_ctx=service_ctx,
             assurance_job_ids=assurance_ids,
-            retest_roles=retest_roles,
+            retest_roles=effective_retest_roles,
         )
     else:
         emit_projectos_event(
