@@ -517,7 +517,11 @@ def orchestrate_release_capability(
     repo_root = _resolve_repo_root(ctx, project_id)
     with connection(ctx.db_path) as lookup_conn:
         release_human_id = _next_release_human_id(lookup_conn, project_id)
-    version = "1.0.0"
+        from projectos.delivery.release_version import resolve_release_version
+
+        version = resolve_release_version(
+            lookup_conn, project_id=project_id, repo_root=repo_root
+        )
     adapter_id = "unknown"
     if repo_root:
         try:
@@ -700,30 +704,47 @@ def orchestrate_release_capability(
         adapter_id=adapter_id,
     )
     if stub_installer:
-        from projectos.run_evidence import close_execution_run
+        from projectos.pm_delivery_remediation import handle_capability_gap
 
-        with connection(ctx.db_path) as close_conn:
-            close_execution_run(
-                close_conn,
+        with connection(ctx.db_path) as gap_conn:
+            handle_capability_gap(
+                gap_conn,
                 event_ctx=event_ctx,
-                outcome=OUTCOME_UNRECOVERABLE_TECHNICAL,
-                summary="Requested finished installer cannot be supplied.",
-                detail=evidence_text,
-                failure={
+                gap={
+                    "blocker_type": "INSTALLER_BACKEND_MISSING",
+                    "reason": "python_desktop adapter produces placeholder installer only",
+                    "retryable": True,
                     "phase": "INSTALLER",
-                    "reason": "python_desktop adapter produces stub installer only",
-                    "retryable": False,
-                    "required_action": "Provide production packaging adapter",
                 },
             )
-        return evidence_text
+        return (
+            f"{evidence_text}\n\n"
+            "PM is managing installer capability remediation; run remains active."
+        )
 
     published_url = None
     try:
         published = svc.publish_release(release_record_id, event_context=event_ctx)
         published_url = published.get("github_release_url") or published.get("download_url")
-    except OrchestrationError:
-        pass
+    except OrchestrationError as pub_exc:
+        with connection(ctx.db_path) as pub_conn:
+            emit_projectos_event(
+                pub_conn,
+                ctx=event_ctx,
+                event_type="PUBLICATION_FAILED",
+                summary=str(pub_exc)[:500],
+                actor_id=ACTOR_PM,
+                phase="PUBLICATION_GATE",
+                status="FAILED",
+                detail_level="milestone",
+                evidence={"release_record_id": release_record_id, "reason": str(pub_exc)[:500]},
+            )
+        return (
+            f"*ProjectOS PM — PUBLICATION FAILED*\n"
+            f"Run: `{event_ctx.run_id}`\n"
+            f"Release: `{release_human_id}`\n"
+            "PM is managing remediation; run remains active."
+        )
 
     return _format_release_evidence(
         run_id=event_ctx.run_id or "",

@@ -142,17 +142,28 @@ def emit_package_completed(
         emit_projectos_event(
             conn,
             ctx=replace(ctx, release_id=release_human_id),
-            event_type="RELEASE_BLOCKED",
-            summary="Production installer adapter unavailable (stub installer).",
-            actor_id=ACTOR_RELEASE,
-            phase="PUBLICATION_GATE",
-            status="BLOCKED",
+            event_type="CAPABILITY_GAP_DETECTED",
+            summary="Installer backend unavailable; placeholder artifact produced.",
+            actor_id=ACTOR_PM,
+            phase="CAPABILITY",
             detail_level="milestone",
             evidence={
                 "stub_installer": True,
                 "adapter": adapter_id,
-                "production_installer_unavailable": True,
+                "blocker_type": "INSTALLER_BACKEND_MISSING",
+                "retryable": True,
             },
+        )
+    elif installer:
+        emit_projectos_event(
+            conn,
+            ctx=replace(ctx, release_id=release_human_id),
+            event_type="INSTALLER_BUILT",
+            summary=f"Installer built: {installer.get('artifact_name')}",
+            actor_id=ACTOR_DELIVERY,
+            phase="PACKAGE_GATE",
+            detail_level="milestone",
+            evidence=evidence,
         )
 
 

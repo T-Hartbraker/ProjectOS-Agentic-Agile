@@ -77,8 +77,9 @@ class PythonDesktopAdapter:
             artifact_path = output_dir / artifact_name.replace(".exe", ".zip")
             self._package_zip(repo_root, contract, artifact_path)
         else:
-            artifact_path = output_dir / artifact_name
-            self._package_stub_exe(repo_root, contract, artifact_path, version=version, git_sha=git_sha)
+            product_slug = product.replace(" ", "")
+            artifact_path = output_dir / f"{product_slug}-installer-placeholder.json"
+            self._package_stub_placeholder(repo_root, contract, artifact_path, version=version, git_sha=git_sha)
         sha = _sha256_file(artifact_path)
         artifact = PackagingArtifact(
             artifact_name=artifact_path.name,
@@ -117,12 +118,16 @@ class PythonDesktopAdapter:
             if readme.is_file():
                 zf.write(readme, arcname="README.md")
 
-    def _package_stub_exe(self, repo_root: Path, contract: DeliveryContract, artifact_path: Path, *, version: str, git_sha: str) -> None:
+    def _package_stub_placeholder(
+        self, repo_root: Path, contract: DeliveryContract, artifact_path: Path, *, version: str, git_sha: str
+    ) -> None:
         payload = {
+            "placeholder": True,
             "product": contract.product_name or repo_root.name,
             "version": version,
             "git_sha": git_sha,
             "adapter": self.adapter_id,
+            "note": "Honest placeholder until a real installer backend is configured.",
         }
         artifact_path.write_bytes(json.dumps(payload, indent=2).encode("utf-8"))
 
