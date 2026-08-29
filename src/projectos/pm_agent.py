@@ -169,6 +169,24 @@ def _apply_active_run_directive(
             evidence=directive_evidence,
         )
         agent_id = ACTOR_DEVELOPER if request_type in {"DEFECT", "WORK"} else ACTOR_PM
+        from projectos.remediation_store import create_remediation_work
+        from projectos.remediation_executor import execute_remediation_work
+
+        repo_root = _resolve_repo_root(ctx, project_id)
+        work = create_remediation_work(
+            conn,
+            run_id=run_id,
+            project_id=project_id,
+            remediation_cycle=0,
+            finding_ids=[],
+            assigned_agent=agent_id,
+            objective=handoff.objective[:2000],
+            acceptance_criteria="Sponsor directive satisfied with governed evidence.",
+            source_candidate_id=None,
+            repository_root=str(repo_root.resolve()) if repo_root else "/repo",
+            assignment_reason="Active-run sponsor directive",
+            findings=[directive_evidence],
+        )
         emit_projectos_event(
             conn,
             ctx=thread,
@@ -176,8 +194,20 @@ def _apply_active_run_directive(
             summary=f"Assigned: {agent_id} for Sponsor directive.",
             actor_id=ACTOR_PM,
             phase="PLANNING",
-            metadata={"agent_id": agent_id},
-            evidence=directive_evidence,
+            metadata={"agent_id": agent_id, "work_item_id": work.work_item_id},
+            evidence={
+                "work_item_id": work.work_item_id,
+                "orchestration_job_id": work.orchestration_job_id,
+                **directive_evidence,
+            },
+        )
+        execute_remediation_work(
+            conn,
+            work=work,
+            event_ctx=thread,
+            project_id=project_id,
+            repository_root=str(repo_root.resolve()) if repo_root else "/repo",
+            retest_result="pass",
         )
 
     projectos_text = (
@@ -535,7 +565,10 @@ def orchestrate_release_capability(
         from projectos.pm_remediation import run_qa_with_remediation
 
         qa_result = run_qa_with_remediation(
-            qa_conn, event_ctx=event_ctx, project_id=project_id
+            qa_conn,
+            event_ctx=event_ctx,
+            project_id=project_id,
+            repository_root=str(repo_root.resolve()) if repo_root else "/repo",
         )
 
     if qa_result.escalated:
@@ -716,6 +749,8 @@ def orchestrate_release_capability(
                     "retryable": True,
                     "phase": "INSTALLER",
                 },
+                project_id=project_id,
+                repository_root=str(repo_root.resolve()) if repo_root else "/repo",
             )
         return (
             f"{evidence_text}\n\n"
