@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any
 
 from projectos.domain_events import ACTOR_PM, EventContext, emit_projectos_event
+from projectos.candidate_model import get_run_active_candidate
 from projectos.execution_run import get_execution_run, update_execution_run
 from projectos.qa_gate import collect_qa_gate_facts
 from projectos.run_outcomes import (
@@ -168,6 +169,8 @@ def build_terminal_evidence(conn: sqlite3.Connection, *, run_id: str) -> dict[st
             if art.get("artifact_type") == "installer":
                 art["publication_url"] = publication_url
 
+    active_candidate = get_run_active_candidate(conn, run_id)
+
     return {
         "run_id": run.run_id,
         "handoff_id": run.handoff_id,
@@ -182,7 +185,12 @@ def build_terminal_evidence(conn: sqlite3.Connection, *, run_id: str) -> dict[st
         "release_id": release_id,
         "release_record_id": release_record_id,
         "artifacts": artifacts,
-        "qa": collect_qa_gate_facts(conn, project_id=run.project_id),
+        "qa": collect_qa_gate_facts(
+            conn,
+            project_id=run.project_id,
+            run_id=run_id,
+            candidate_git_sha=active_candidate,
+        ),
         "failure": failure,
         "started_at": run.started_at,
         "completed_at": run.completed_at,
@@ -335,9 +343,54 @@ def maybe_close_run_after_event(
         return
 
     if event_type == "RELEASE_PUBLISHED":
+        run = get_execution_run(conn, run_id)
+        if run is None:
+            return
+        from projectos.sponsor_outcome import evaluate_sponsor_outcome
+
+        evaluation = evaluate_sponsor_outcome(
+            conn,
+            run_id=run_id,
+            handoff_id=run.handoff_id,
+            objective=run.objective or "",
+            release_record_id=release_record_id_from_event(conn, run_id),
+            candidate_git_sha=active_candidate_sha(conn, run_id),
+        )
+        if not evaluation.satisfied:
+            emit_projectos_event(
+                conn,
+                ctx=event_ctx,
+                event_type="SPONSOR_OUTCOME_INCOMPLETE",
+                summary="Release published but sponsor-requested outcomes are not satisfied.",
+                actor_id=ACTOR_PM,
+                phase="terminal",
+                detail_level="milestone",
+                evidence={
+                    "required_outputs": evaluation.required_outputs,
+                    "missing_outputs": evaluation.missing_outputs,
+                    "satisfied_outputs": evaluation.satisfied_outputs,
+                },
+            )
+            return
         close_execution_run(
             conn,
             event_ctx=event_ctx,
             outcome=OUTCOME_SUCCESS,
-            summary="Release published successfully.",
+            summary="Sponsor-requested outcomes verified.",
         )
+
+
+def release_record_id_from_event(conn: sqlite3.Connection, run_id: str) -> str | None:
+    row = conn.execute(
+        """
+        SELECT artifact_id FROM projectos_events
+        WHERE run_id = ? AND release_id IS NOT NULL
+        ORDER BY occurred_at DESC LIMIT 1
+        """,
+        (run_id,),
+    ).fetchone()
+    return str(row["artifact_id"]) if row and row["artifact_id"] else None
+
+
+def active_candidate_sha(conn: sqlite3.Connection, run_id: str) -> str | None:
+    return get_run_active_candidate(conn, run_id)

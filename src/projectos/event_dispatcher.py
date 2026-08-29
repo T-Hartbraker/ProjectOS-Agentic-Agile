@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from projectos.db import connection
@@ -30,14 +31,64 @@ def list_pending_subscriber_outbox(
     return [dict(row) for row in rows]
 
 
+def claim_pending_outbox(
+    conn,
+    *,
+    subscriber: str,
+    claimed_by: str,
+    limit: int = 25,
+    lease_seconds: int = 300,
+) -> list[dict[str, Any]]:
+    expires = (
+        datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    conn.execute(
+        """
+        UPDATE event_outbox
+        SET status = 'pending', claimed_by = NULL, claim_expires_at = NULL
+        WHERE subscriber = ? AND status = 'claimed'
+          AND claim_expires_at IS NOT NULL
+          AND claim_expires_at < datetime('now')
+        """,
+        (subscriber,),
+    )
+    pending = list_pending_subscriber_outbox(conn, subscriber=subscriber, limit=limit)
+    claimed: list[dict[str, Any]] = []
+    for row in pending:
+        cur = conn.execute(
+            """
+            UPDATE event_outbox
+            SET status = 'claimed', claimed_by = ?, claim_expires_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (claimed_by, expires, int(row["id"])),
+        )
+        if cur.rowcount == 1:
+            claimed.append(row)
+    return claimed
+
+
 def mark_subscriber_delivered(conn, *, outbox_id: int) -> None:
     conn.execute(
         """
         UPDATE event_outbox
-        SET status = 'delivered', delivered_at = datetime('now')
+        SET status = 'delivered', delivered_at = datetime('now'),
+            claimed_by = NULL, claim_expires_at = NULL
         WHERE id = ?
         """,
         (outbox_id,),
+    )
+
+
+def mark_subscriber_unroutable(conn, *, outbox_id: int, error: str) -> None:
+    conn.execute(
+        """
+        UPDATE event_outbox
+        SET status = 'unroutable', last_error = ?,
+            claimed_by = NULL, claim_expires_at = NULL
+        WHERE id = ?
+        """,
+        (str(error or "")[:500], outbox_id),
     )
 
 
@@ -47,7 +98,9 @@ def mark_subscriber_failed(conn, *, outbox_id: int, error: str) -> None:
         UPDATE event_outbox
         SET attempts = attempts + 1,
             last_error = ?,
-            status = CASE WHEN attempts + 1 >= 10 THEN 'dead' ELSE 'pending' END
+            status = CASE WHEN attempts + 1 >= 10 THEN 'dead' ELSE 'pending' END,
+            claimed_by = NULL,
+            claim_expires_at = NULL
         WHERE id = ?
         """,
         (str(error or "")[:500], outbox_id),
@@ -72,25 +125,50 @@ def _slack_payload_to_blocks(payload: dict[str, Any]) -> tuple[str, list[dict[st
     return text, blocks
 
 
+def _stream_key(payload: dict[str, Any], subscriber: str) -> str:
+    return "|".join(
+        [
+            subscriber,
+            str(payload.get("slack_channel_id") or ""),
+            str(payload.get("slack_thread_ts") or ""),
+            str(payload.get("run_id") or ""),
+        ]
+    )
+
+
 def dispatch_event_outbox(
     db_path,
     *,
     subscriber: str = "slack",
     http_post: Callable | None = None,
     limit: int = 25,
+    claimed_by: str = "dispatcher",
 ) -> dict[str, int]:
     from projectos.agent_activity import get_activity_detail_level
 
     delivered = 0
     failed = 0
+    unroutable = 0
     with connection(db_path) as conn:
         sponsor_level = get_activity_detail_level(conn)
-        pending = list_pending_subscriber_outbox(conn, subscriber=subscriber, limit=limit)
+        pending = claim_pending_outbox(
+            conn, subscriber=subscriber, claimed_by=claimed_by, limit=limit
+        )
+        conn.commit()
 
+    blocked_streams: set[str] = set()
     for row in pending:
         outbox_id = int(row["id"])
         try:
             payload = json.loads(str(row["payload_json"] or "{}"))
+            stream = _stream_key(payload, subscriber)
+            if stream in blocked_streams:
+                with connection(db_path) as conn:
+                    mark_subscriber_failed(
+                        conn, outbox_id=outbox_id, error="causal ordering hold"
+                    )
+                failed += 1
+                continue
             if subscriber == "slack":
                 if not _should_project(payload, sponsor_level):
                     with connection(db_path) as conn:
@@ -101,8 +179,12 @@ def dispatch_event_outbox(
                 thread_ts = str(payload.get("slack_thread_ts") or "") or None
                 if not channel_id:
                     with connection(db_path) as conn:
-                        mark_subscriber_delivered(conn, outbox_id=outbox_id)
-                    delivered += 1
+                        mark_subscriber_unroutable(
+                            conn,
+                            outbox_id=outbox_id,
+                            error="missing slack_channel_id",
+                        )
+                    unroutable += 1
                     continue
                 text, blocks = _slack_payload_to_blocks(payload)
                 post_message(
@@ -118,8 +200,9 @@ def dispatch_event_outbox(
         except Exception as exc:  # noqa: BLE001
             with connection(db_path) as conn:
                 mark_subscriber_failed(conn, outbox_id=outbox_id, error=str(exc))
+            blocked_streams.add(_stream_key(payload, subscriber))
             failed += 1
-    return {"delivered": delivered, "failed": failed}
+    return {"delivered": delivered, "failed": failed, "unroutable": unroutable}
 
 
 def outbox_diagnostics(conn) -> dict[str, int]:
