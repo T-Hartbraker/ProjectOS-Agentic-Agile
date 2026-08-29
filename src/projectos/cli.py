@@ -165,11 +165,13 @@ def cmd_api(args: argparse.Namespace) -> int:
         return 1
     from projectos.dashboard_build import ensure_dashboard_built
     from projectos.http import create_app
+    from projectos.http.bind_policy import ensure_safe_bind
 
     try:
         ensure_dashboard_built()
     except RuntimeError as exc:
         print(f"warning: dashboard build failed: {exc}", file=sys.stderr)
+    ensure_safe_bind(host=args.host, auth_required=False)
     app = create_app(registry_path=args.config, db_path=getattr(args, "db", None))
     uvicorn.run(app, host=args.host, port=args.port)
     return 0

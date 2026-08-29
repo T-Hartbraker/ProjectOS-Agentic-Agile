@@ -10,6 +10,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args(argv)
+    from projectos.http.bind_policy import ensure_safe_bind
+
+    ensure_safe_bind(host=args.host, auth_required=False)
     try:
         import uvicorn
     except ImportError as exc:
