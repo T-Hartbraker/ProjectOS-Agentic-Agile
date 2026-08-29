@@ -81,6 +81,7 @@ def test_security_finding_executes_via_delivery_queue() -> None:
 def test_qa_fail_does_not_create_rework_job(tmp_path: Path) -> None:
     db, repo_root = _ctx(tmp_path)
     with connection(db) as conn:
+        event_ctx = _seed_run(conn)
         delivery = create_job(
             conn,
             human_id="DEL-1",
@@ -90,6 +91,7 @@ def test_qa_fail_does_not_create_rework_job(tmp_path: Path) -> None:
             queue="DELIVERY",
             status="SUCCEEDED",
             base_git_sha="shaA",
+            run_id=event_ctx.run_id,
         )
         assurance = create_job(
             conn,
@@ -100,6 +102,7 @@ def test_qa_fail_does_not_create_rework_job(tmp_path: Path) -> None:
             queue="ASSURANCE_SECURITY",
             status="SUCCEEDED",
             base_git_sha="shaA",
+            run_id=event_ctx.run_id,
         )
         from projectos.store import insert_qa_evidence, set_job_source_provenance
 
@@ -160,6 +163,7 @@ def test_stale_null_run_qa_does_not_satisfy_current_run(tmp_path: Path) -> None:
 def test_qa_manager_aggregates_assessor_evidence(tmp_path: Path) -> None:
     db, repo_root = _ctx(tmp_path)
     with connection(db) as conn:
+        event_ctx = _seed_run(conn)
         delivery = create_job(
             conn,
             human_id="DEL-MGR",
@@ -169,6 +173,7 @@ def test_qa_manager_aggregates_assessor_evidence(tmp_path: Path) -> None:
             queue="DELIVERY",
             status="SUCCEEDED",
             base_git_sha="sha-base",
+            run_id=event_ctx.run_id,
         )
         conn.execute(
             "UPDATE orchestration_jobs SET candidate_git_sha = 'shaB', base_git_sha = 'sha-base' WHERE id = ?",
@@ -184,6 +189,10 @@ def test_qa_manager_aggregates_assessor_evidence(tmp_path: Path) -> None:
             ).fetchone()
             assurance = get_job(conn, int(job["id"]))
             record_assurance_result(conn, assurance, verdict="PASS", evidence_ref="ok")
+            conn.execute(
+                "UPDATE qa_evidence SET run_id = ? WHERE assurance_job_id = ?",
+                (event_ctx.run_id, assurance.id),
+            )
         mgr = conn.execute(
             "SELECT id FROM orchestration_jobs WHERE human_id = ?",
             (f"{delivery.human_id}__QA_MANAGER",),

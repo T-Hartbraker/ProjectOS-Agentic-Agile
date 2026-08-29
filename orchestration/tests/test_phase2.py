@@ -420,6 +420,27 @@ def test_qa_pass_fail_rework_and_stale_evidence(tmp_path: Path) -> None:
     repo = init_git_repo(tmp_path / "repo")
     db = seed_db(tmp_path / "projectos.db")
     with connection(db) as conn:
+        from projectos.execution_run import create_execution_run
+        from projectos.sponsor_handoff import create_sponsor_handoff, mark_handoff_accepted
+
+        handoff_row = create_sponsor_handoff(
+            conn,
+            project_id="PRJ-003",
+            team_id="T1",
+            channel_id="C1",
+            thread_ts="1.0",
+            sponsor_user_id="U1",
+            request_type="RELEASE",
+            objective="ship",
+        )
+        run = create_execution_run(
+            conn,
+            project_id="PRJ-003",
+            handoff_id=handoff_row.handoff_id,
+            request_type="RELEASE",
+            objective="ship",
+        )
+        mark_handoff_accepted(conn, handoff_id=handoff_row.handoff_id, run_id=run.run_id)
         delivery = create_job(
             conn,
             human_id="JOB-D1",
@@ -429,6 +450,7 @@ def test_qa_pass_fail_rework_and_stale_evidence(tmp_path: Path) -> None:
             queue="DELIVERY",
             status="RUNNING",
             requires_worktree=True,
+            run_id=run.run_id,
         )
         mark_succeeded(conn, delivery.id, output_ref=None, candidate_git_sha="sha-old")
         conn.execute(

@@ -56,6 +56,41 @@ def _db(tmp_path: Path) -> tuple[Path, str]:
     return db, repo_root
 
 
+def _seed_run(conn) -> EventContext:
+    handoff = create_sponsor_handoff(
+        conn,
+        project_id="PRJ-003",
+        team_id="T1",
+        channel_id="C1",
+        thread_ts="1.0",
+        sponsor_user_id="U1",
+        request_type="RELEASE",
+        objective="ship",
+    )
+    run = create_execution_run(
+        conn,
+        project_id="PRJ-003",
+        handoff_id=handoff.handoff_id,
+        request_type="RELEASE",
+        objective="ship",
+    )
+    mark_handoff_accepted(conn, handoff_id=handoff.handoff_id, run_id=run.run_id)
+    update_execution_run(conn, run_id=run.run_id, status="RUNNING")
+    return EventContext(project_id="PRJ-003", handoff_id=handoff.handoff_id, run_id=run.run_id)
+
+
+_RUN_CACHE: dict[int, str] = {}
+
+
+def _run_id_for_conn(conn, run_id: str | None) -> str:
+    if run_id is not None:
+        return run_id
+    key = id(conn)
+    if key not in _RUN_CACHE:
+        _RUN_CACHE[key] = _seed_run(conn).run_id
+    return _RUN_CACHE[key]
+
+
 def _assurance_job(
     conn,
     repo_root: str,
@@ -64,7 +99,9 @@ def _assurance_job(
     human_id: str = "QA-FUNC-1",
     delivery_human_id: str = "DEL-1",
     queue: str = "ASSURANCE_FUNCTIONAL",
+    run_id: str | None = None,
 ) -> tuple[object, int]:
+    resolved_run_id = _run_id_for_conn(conn, run_id)
     delivery = create_job(
         conn,
         human_id=delivery_human_id,
@@ -74,6 +111,7 @@ def _assurance_job(
         queue="DELIVERY",
         status="SUCCEEDED",
         base_git_sha=candidate,
+        run_id=resolved_run_id,
     )
     conn.execute(
         "UPDATE orchestration_jobs SET candidate_git_sha = ? WHERE id = ?",
@@ -88,6 +126,7 @@ def _assurance_job(
         queue=queue,
         status="SUCCEEDED",
         base_git_sha=candidate,
+        run_id=resolved_run_id,
     )
     set_job_source_provenance(
         conn,
@@ -105,6 +144,7 @@ def _assurance_job(
         candidate_git_sha=candidate,
         assurance_role=queue,
         result="pending",
+        run_id=resolved_run_id,
     )
     return assurance, delivery.id
 
@@ -132,29 +172,6 @@ def _stdout_for(assurance, *, verdict: str, **overrides) -> str:
     payload = result.to_dict()
     payload.update(overrides)
     return f"{ASSURANCE_RESULT_MARKER}\n{json.dumps(payload)}"
-
-
-def _seed_run(conn) -> EventContext:
-    handoff = create_sponsor_handoff(
-        conn,
-        project_id="PRJ-003",
-        team_id="T1",
-        channel_id="C1",
-        thread_ts="1.0",
-        sponsor_user_id="U1",
-        request_type="RELEASE",
-        objective="ship",
-    )
-    run = create_execution_run(
-        conn,
-        project_id="PRJ-003",
-        handoff_id=handoff.handoff_id,
-        request_type="RELEASE",
-        objective="ship",
-    )
-    mark_handoff_accepted(conn, handoff_id=handoff.handoff_id, run_id=run.run_id)
-    update_execution_run(conn, run_id=run.run_id, status="RUNNING")
-    return EventContext(project_id="PRJ-003", handoff_id=handoff.handoff_id, run_id=run.run_id)
 
 
 def _seed_qa(conn, *, candidate: str, failed: int, total: int, repo_root: str, run_id: str) -> None:

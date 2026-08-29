@@ -217,14 +217,8 @@ def test_worker_failure_event_visible(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path)
     initialize_database(ctx.db_path)
     from projectos.cockpit_worker import emit_worker_terminal_event
+    from projectos.store import create_job
 
-    job = MagicMock()
-    job.id = None
-    job.human_id = "JOB-001"
-    job.project_human_id = "PRJ-003"
-    job.queue = "ASSURANCE_FUNCTIONAL"
-    job.agent_role = "ASSURANCE_FUNCTIONAL"
-    job.work_item_human_id = None
     with connection(ctx.db_path) as conn:
         conn.execute(
             """
@@ -240,6 +234,16 @@ def test_worker_failure_event_visible(tmp_path: Path) -> None:
                 run_id, project_id, handoff_id, request_type, objective, status
             ) VALUES ('RUN-1', 'PRJ-003', 'HND-1', 'RELEASE', 'ship', 'RUNNING')
             """
+        )
+        job = create_job(
+            conn,
+            human_id="JOB-001",
+            project_human_id="PRJ-003",
+            repository_root=str(tmp_path / "repo"),
+            agent_role="ASSURANCE_FUNCTIONAL",
+            queue="ASSURANCE_FUNCTIONAL",
+            status="FAILED",
+            run_id="RUN-1",
         )
         emit_worker_terminal_event(conn, job, status="FAILED", error="tests failed")
     with connection(ctx.db_path) as conn:
