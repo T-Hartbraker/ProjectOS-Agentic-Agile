@@ -12,6 +12,7 @@ from helpers import init_git_repo, write_identity, write_registry
 from projectos.db import connection
 from projectos.domain_events import EventContext, emit_projectos_event, ACTOR_PM
 from projectos.event_dispatcher import dispatch_event_outbox
+from projectos.errors import OrchestrationError
 from projectos.migrate import initialize_database
 from projectos.pm_capabilities import ensure_pm_run_for_approved_proposal, proposal_to_handoff
 from projectos.services.context import ServiceContext
@@ -406,7 +407,7 @@ def test_stub_installer_blocks_run_completion(tmp_path: Path, monkeypatch) -> No
     assert row["status"] == "BLOCKED"
 
 
-def test_release_published_triggers_pm_run_completion(tmp_path: Path) -> None:
+def test_release_published_without_evidence_does_not_complete_run(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path)
     with connection(ctx.db_path) as conn:
         conn.execute(
@@ -424,17 +425,20 @@ def test_release_published_triggers_pm_run_completion(tmp_path: Path) -> None:
             ) VALUES ('RUN-PUB', 'PRJ-003', 'HND-1', 'RELEASE', 'ship', 'RUNNING')
             """
         )
-        emit_projectos_event(
-            conn,
-            ctx=EventContext(project_id="PRJ-003", run_id="RUN-PUB"),
-            event_type="RELEASE_PUBLISHED",
-            summary="published",
-            actor_id=ACTOR_PM,
-        )
+        try:
+            emit_projectos_event(
+                conn,
+                ctx=EventContext(project_id="PRJ-003", run_id="RUN-PUB"),
+                event_type="RELEASE_PUBLISHED",
+                summary="published",
+                actor_id=ACTOR_PM,
+            )
+        except OrchestrationError:
+            pass
         row = conn.execute(
             "SELECT status FROM execution_runs WHERE run_id = 'RUN-PUB'"
         ).fetchone()
-    assert row["status"] == "COMPLETED"
+    assert row["status"] == "RUNNING"
 
 
 def test_terminal_evidence_is_authoritative(tmp_path: Path) -> None:
