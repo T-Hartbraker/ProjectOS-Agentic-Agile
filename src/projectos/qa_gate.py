@@ -36,19 +36,22 @@ def collect_qa_gate_facts(
         params,
     ).fetchall()
     reviews_total = len(rows)
-    passed = [r for r in rows if str(r["result"]) == "pass"]
-    failed = [
-        r
-        for r in rows
-        if str(r["result"]) in {"fail", "stale_rejected"}
-        or str(r["job_status"] or "") in {"FAILED", "BLOCKED"}
-    ]
-    pending = [
-        r
-        for r in rows
-        if str(r["result"]) == "pending"
-        or str(r["job_status"] or "") in {"READY", "QUEUED", "LEASED", "RUNNING"}
-    ]
+    passed = []
+    failed = []
+    pending = []
+    for r in rows:
+        result = str(r["result"] or "")
+        job_status = str(r["job_status"] or "")
+        if result in {"fail", "stale_rejected"}:
+            failed.append(r)
+        elif result == "pass":
+            passed.append(r)
+        elif result == "pending" or job_status in {"READY", "QUEUED", "LEASED", "RUNNING"}:
+            pending.append(r)
+        elif job_status in {"FAILED", "BLOCKED"}:
+            failed.append(r)
+        else:
+            pending.append(r)
     if failed:
         gate = "FAILED"
     elif reviews_total and not pending and len(passed) == reviews_total:

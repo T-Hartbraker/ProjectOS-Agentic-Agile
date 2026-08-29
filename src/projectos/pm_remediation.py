@@ -5,13 +5,18 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
-from projectos.candidate_model import latest_candidate_sha, set_run_active_candidate
-from projectos.domain_events import ACTOR_PM, ACTOR_QA, EventContext, emit_projectos_event
+from projectos.candidate_model import (
+    CANDIDATE_TYPE_GIT_SHA,
+    get_run_active_candidate_type,
+    latest_candidate_sha,
+    set_run_active_candidate,
+)
+from projectos.domain_events import ACTOR_PM, EventContext, emit_projectos_event
 from projectos.finding_routing import classify_finding_category, route_finding_to_agent
-from projectos.qa_evidence_policy import QAEvidenceImmutableError
 from projectos.qa_gate import collect_qa_gate_facts, emit_qa_gate_evaluation, emit_qa_finding_created
+from projectos.qa_retest import AssuranceExecutor, execute_qa_retest
 from projectos.remediation_executor import RemediationExecutionResult, RemediationWorker, execute_remediation_work
 from projectos.remediation_store import create_remediation_work
 from projectos.run_evidence import close_execution_run
@@ -84,17 +89,6 @@ def collect_qa_findings(
     return findings
 
 
-def _remediation_cycle_count(conn: sqlite3.Connection, *, run_id: str) -> int:
-    row = conn.execute(
-        """
-        SELECT COUNT(*) AS n FROM projectos_events
-        WHERE run_id = ? AND event_type = 'REMEDIATION_STARTED'
-        """,
-        (run_id,),
-    ).fetchone()
-    return int(row["n"] if row else 0)
-
-
 def _finding_recurrence(conn: sqlite3.Connection, *, run_id: str, category: str) -> int:
     """Count remediation cycles that addressed the same finding category."""
     import json
@@ -122,37 +116,6 @@ def _finding_recurrence(conn: sqlite3.Connection, *, run_id: str, category: str)
     return count
 
 
-def _evaluate_retest_candidate(
-    conn: sqlite3.Connection,
-    *,
-    project_id: str,
-    candidate_sha: str,
-    pass_retest: bool,
-) -> None:
-    """Apply initial QA evaluation to pending evidence for a new candidate."""
-    from projectos.qa_evidence_policy import update_qa_evidence_result
-
-    rows = conn.execute(
-        """
-        SELECT id, assurance_job_id, candidate_git_sha, result
-        FROM qa_evidence
-        WHERE project_human_id = ? AND candidate_git_sha = ? AND result = 'pending'
-        """,
-        (project_id, candidate_sha),
-    ).fetchall()
-    new_result = "pass" if pass_retest else "fail"
-    for row in rows:
-        if row["assurance_job_id"] is None:
-            continue
-        update_qa_evidence_result(
-            conn,
-            assurance_job_id=int(row["assurance_job_id"]),
-            candidate_git_sha=str(row["candidate_git_sha"]),
-            new_result=new_result,
-            evidence_ref=f"retest:{candidate_sha}",
-        )
-
-
 def start_remediation_cycle(
     conn: sqlite3.Connection,
     *,
@@ -164,7 +127,7 @@ def start_remediation_cycle(
     repository_root: str,
     worker: RemediationWorker | None = None,
     service_ctx=None,
-    retest_passes: bool = True,
+    assurance_executor: AssuranceExecutor | None = None,
 ) -> RemediationExecutionResult:
     source_candidate = latest_candidate_sha(conn, project_id=project_id, run_id=event_ctx.run_id)
     remediation_meta = {
@@ -244,7 +207,6 @@ def start_remediation_cycle(
         evidence={"work_item_id": work.work_item_id, "orchestration_job_id": work.orchestration_job_id},
     )
 
-    roles = [str(f.get("source_gate_or_review") or "") for f in findings if f.get("source_gate_or_review")]
     outcome = execute_remediation_work(
         conn,
         work=work,
@@ -253,21 +215,48 @@ def start_remediation_cycle(
         repository_root=repository_root,
         worker=worker,
         service_ctx=service_ctx,
-        retest_roles=roles or None,
-        retest_result="pending",
     )
-    if outcome.target_candidate_id:
-        _evaluate_retest_candidate(
+    if outcome.status != "COMPLETED" or not outcome.target_candidate_id:
+        return outcome
+
+    roles = [str(f.get("source_gate_or_review") or "") for f in findings if f.get("source_gate_or_review")]
+    retest = execute_qa_retest(
+        conn,
+        event_ctx=event_ctx,
+        project_id=project_id,
+        repository_root=repository_root,
+        candidate_id=outcome.target_candidate_id,
+        candidate_type=outcome.candidate_type,
+        run_id=event_ctx.run_id,
+        remediation_cycle=attempt_number,
+        retest_roles=roles or None,
+        source_remediation_job_id=work.orchestration_job_id,
+        source_candidate_id=source_candidate,
+        service_ctx=service_ctx,
+        assurance_executor=assurance_executor,
+    )
+    set_run_active_candidate(
+        conn,
+        run_id=event_ctx.run_id or project_id,
+        candidate_id=retest.candidate_id,
+        candidate_type=retest.candidate_type,
+        remediation_cycle=attempt_number,
+    )
+    if retest.gate == "PASSED":
+        emit_qa_gate_evaluation(
             conn,
             project_id=project_id,
-            candidate_sha=outcome.target_candidate_id,
-            pass_retest=retest_passes,
+            event_context=event_ctx,
+            candidate_git_sha=retest.candidate_id,
+            run_id=event_ctx.run_id,
         )
-        set_run_active_candidate(
+    elif retest.gate == "FAILED":
+        emit_qa_gate_evaluation(
             conn,
-            run_id=event_ctx.run_id or project_id,
-            candidate_id=outcome.target_candidate_id,
-            remediation_cycle=attempt_number,
+            project_id=project_id,
+            event_context=event_ctx,
+            candidate_git_sha=retest.candidate_id,
+            run_id=event_ctx.run_id,
         )
     return outcome
 
@@ -282,8 +271,7 @@ def run_qa_with_remediation(
     max_same_finding_recurrence: int = DEFAULT_MAX_SAME_FINDING_RECURRENCE,
     worker: RemediationWorker | None = None,
     service_ctx=None,
-    retest_passes: bool = True,
-    cycle_retest_passes: Callable[[int], bool] | None = None,
+    assurance_executor: AssuranceExecutor | None = None,
 ) -> RemediationResult:
     """Evaluate QA gate with PM-owned remediation cycles until pass or escalation."""
     if not event_ctx.run_id:
@@ -337,7 +325,6 @@ def run_qa_with_remediation(
                 )
 
         cycles += 1
-        passes = cycle_retest_passes(cycles) if cycle_retest_passes else retest_passes
         start_remediation_cycle(
             conn,
             event_ctx=event_ctx,
@@ -348,7 +335,7 @@ def run_qa_with_remediation(
             repository_root=repository_root,
             worker=worker,
             service_ctx=service_ctx,
-            retest_passes=passes,
+            assurance_executor=assurance_executor,
         )
 
     candidate = latest_candidate_sha(conn, project_id=project_id, run_id=event_ctx.run_id)
