@@ -13,6 +13,8 @@ from projectos.errors import OrchestrationError
 from projectos.store import create_job, utc_now_iso
 
 AGENT_TO_QUEUE = {
+    # developer-agent uses DELIVERY queue — the code-modifying worker path in ProjectOS.
+    # DELIVERY jobs run in a worktree and may change source; see CODE_MODIFYING_ROLES.
     "developer-agent": "DELIVERY",
     "architecture-agent": "ARCHITECTURE",
     "security-agent": "ASSURANCE_SECURITY",
