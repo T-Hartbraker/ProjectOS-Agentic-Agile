@@ -1,4 +1,4 @@
-"""Persisted remediation work linked to orchestration jobs."""
+"""Remediation work persistence — owner vs executor and durable sequencing."""
 
 from __future__ import annotations
 
@@ -10,17 +10,21 @@ from typing import Any
 
 from projectos.constants import QUEUE_TO_ROLE
 from projectos.errors import OrchestrationError
+from projectos.remediation_capability import resolve_remediation_execution
 from projectos.store import create_job, utc_now_iso
+from projectos.work_sequencing import (
+    ensure_work_sequence_column,
+    next_work_sequence,
+    remediation_job_human_id,
+)
 
 AGENT_TO_QUEUE = {
-    # developer-agent uses DELIVERY queue — the code-modifying worker path in ProjectOS.
-    # DELIVERY jobs run in a worktree and may change source; see CODE_MODIFYING_ROLES.
     "developer-agent": "DELIVERY",
-    "architecture-agent": "ARCHITECTURE",
-    "security-agent": "ASSURANCE_SECURITY",
+    "architecture-agent": "DELIVERY",
+    "security-agent": "DELIVERY",
     "delivery-agent": "DELIVERY",
-    "release-agent": "RELEASE",
-    "qa-agent": "ASSURANCE_QUALITY",
+    "release-agent": "DELIVERY",
+    "qa-agent": "DELIVERY",
     "pm-agent": "PM",
 }
 
@@ -40,6 +44,9 @@ class RemediationWorkRecord:
     target_candidate_id: str | None
     orchestration_job_id: int | None
     result: dict[str, Any]
+    work_sequence: int = 0
+    finding_owner: str | None = None
+    execution_queue: str | None = None
 
 
 def _new_work_item_id() -> str:
@@ -58,6 +65,7 @@ def _row_to_record(row: sqlite3.Row) -> RemediationWorkRecord:
             result = json.loads(str(row["result_json"]))
         except json.JSONDecodeError:
             result = {}
+    keys = row.keys()
     return RemediationWorkRecord(
         work_item_id=str(row["work_item_id"]),
         run_id=str(row["run_id"]),
@@ -72,6 +80,9 @@ def _row_to_record(row: sqlite3.Row) -> RemediationWorkRecord:
         target_candidate_id=row["target_candidate_id"],
         orchestration_job_id=int(row["orchestration_job_id"]) if row["orchestration_job_id"] else None,
         result=result,
+        work_sequence=int(row["work_sequence"]) if "work_sequence" in keys else 0,
+        finding_owner=row["finding_owner"] if "finding_owner" in keys else None,
+        execution_queue=row["execution_queue"] if "execution_queue" in keys else None,
     )
 
 
@@ -89,17 +100,30 @@ def create_remediation_work(
     repository_root: str,
     assignment_reason: str,
     findings: list[dict[str, Any]] | None = None,
+    execution_queue: str | None = None,
+    finding_owner: str | None = None,
 ) -> RemediationWorkRecord:
+    ensure_work_sequence_column(conn)
     work_item_id = _new_work_item_id()
-    queue = AGENT_TO_QUEUE.get(assigned_agent, "DELIVERY")
+    primary = (findings or [{}])[0]
+    owner, executor_agent, default_queue, _ = resolve_remediation_execution(primary)
+    queue = execution_queue or default_queue or AGENT_TO_QUEUE.get(assigned_agent, "DELIVERY")
     role = QUEUE_TO_ROLE.get(queue, "DELIVERY")
-    job_human_id = f"{run_id}__REMEDIATION_{remediation_cycle}__{assigned_agent}"
+    work_sequence = next_work_sequence(conn, run_id=run_id)
+    job_human_id = remediation_job_human_id(
+        run_id=run_id,
+        work_sequence=work_sequence,
+        assigned_agent=assigned_agent,
+    )
     assignment = {
         "remediation_work_item_id": work_item_id,
         "run_id": run_id,
         "remediation_cycle": remediation_cycle,
+        "work_sequence": work_sequence,
         "finding_ids": finding_ids,
         "assigned_agent": assigned_agent,
+        "finding_owner": finding_owner or owner,
+        "execution_queue": queue,
         "reason": assignment_reason,
         "source_candidate_id": source_candidate_id,
         "findings": findings or [],
@@ -119,28 +143,58 @@ def create_remediation_work(
         assignment=assignment,
     )
     now = utc_now_iso()
-    conn.execute(
-        """
-        INSERT INTO remediation_work (
-            work_item_id, run_id, project_id, remediation_cycle, finding_ids_json,
-            assigned_agent, objective, acceptance_criteria, status, source_candidate_id,
-            orchestration_job_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ASSIGNED', ?, ?, ?)
-        """,
-        (
-            work_item_id,
-            run_id,
-            project_id,
-            remediation_cycle,
-            json.dumps(finding_ids, sort_keys=True),
-            assigned_agent,
-            objective[:2000],
-            acceptance_criteria[:2000],
-            source_candidate_id,
-            job.id,
-            now,
-        ),
-    )
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(remediation_work)").fetchall()}
+    if "finding_owner" in cols and "execution_queue" in cols:
+        conn.execute(
+            """
+            INSERT INTO remediation_work (
+                work_item_id, run_id, project_id, remediation_cycle, work_sequence,
+                finding_ids_json, assigned_agent, finding_owner, execution_queue,
+                objective, acceptance_criteria, status, source_candidate_id,
+                orchestration_job_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ASSIGNED', ?, ?, ?)
+            """,
+            (
+                work_item_id,
+                run_id,
+                project_id,
+                remediation_cycle,
+                work_sequence,
+                json.dumps(finding_ids, sort_keys=True),
+                assigned_agent,
+                finding_owner or owner,
+                queue,
+                objective[:2000],
+                acceptance_criteria[:2000],
+                source_candidate_id,
+                job.id,
+                now,
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO remediation_work (
+                work_item_id, run_id, project_id, remediation_cycle, finding_ids_json,
+                assigned_agent, objective, acceptance_criteria, status, source_candidate_id,
+                orchestration_job_id, created_at, work_sequence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ASSIGNED', ?, ?, ?, ?)
+            """,
+            (
+                work_item_id,
+                run_id,
+                project_id,
+                remediation_cycle,
+                json.dumps(finding_ids, sort_keys=True),
+                assigned_agent,
+                objective[:2000],
+                acceptance_criteria[:2000],
+                source_candidate_id,
+                job.id,
+                now,
+                work_sequence,
+            ),
+        )
     row = conn.execute(
         "SELECT * FROM remediation_work WHERE work_item_id = ?", (work_item_id,)
     ).fetchone()
@@ -199,3 +253,15 @@ def list_remediation_work_for_run(conn: sqlite3.Connection, run_id: str) -> list
         (run_id,),
     ).fetchall()
     return [_row_to_record(row) for row in rows]
+
+
+def count_remediation_cycles(conn: sqlite3.Connection, *, run_id: str) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(DISTINCT remediation_cycle) AS cycles
+        FROM remediation_work
+        WHERE run_id = ? AND status IN ('COMPLETED', 'FAILED', 'RUNNING', 'ASSIGNED')
+        """,
+        (run_id,),
+    ).fetchone()
+    return int(row["cycles"] or 0)
