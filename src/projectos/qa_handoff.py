@@ -6,8 +6,16 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from projectos.assurance_verdict import (
+    VERDICT_FAIL,
+    VERDICT_INCONCLUSIVE,
+    VERDICT_PASS,
+    AssuranceResult,
+    AssuranceValidationError,
+    parse_and_validate_assurance_result,
+    verdict_to_evidence_result,
+)
 from projectos.constants import ASSURANCE_QUEUES, CODE_MODIFYING_ROLES, QUEUE_TO_ROLE
-from projectos.db import connection
 from projectos.delivery_evidence import is_valid_qa_candidate
 from projectos.errors import OrchestrationError
 from projectos.projectctl_bridge import create_defect
@@ -19,7 +27,6 @@ from projectos.store import (
     get_job,
     insert_qa_evidence,
     set_job_source_provenance,
-    utc_now_iso,
 )
 
 REQUIRED_ASSURANCE = (
@@ -123,9 +130,6 @@ def create_assurance_jobs_for_delivery(
         source_delivery_job_id=delivery.id,
         source_candidate_sha=candidate_git_sha,
     )
-    for hid in created:
-        # dependency by looking up ids
-        pass
     for queue in REQUIRED_ASSURANCE:
         row = conn.execute(
             "SELECT id FROM orchestration_jobs WHERE human_id = ?",
@@ -150,15 +154,7 @@ def create_assurance_jobs_for_delivery(
     )
 
 
-def record_assurance_result(
-    conn,
-    assurance: OrchestrationJob,
-    *,
-    passed: bool,
-    evidence_ref: str | None = None,
-    create_defect_fn=None,
-) -> None:
-    """Record QA result; reject stale evidence against a newer candidate."""
+def _assert_assurance_recording_allowed(assurance: OrchestrationJob) -> str:
     if (
         assurance.queue not in ASSURANCE_QUEUES
         or assurance.agent_role in CODE_MODIFYING_ROLES
@@ -169,19 +165,28 @@ def record_assurance_result(
     expected = assurance.source_candidate_sha
     if not expected:
         raise OrchestrationError("Assurance job missing source_candidate_sha")
+    return expected
 
-    # Stale evidence: if delivery candidate moved forward, reject.
+
+def _reject_stale_assurance_evidence(
+    conn,
+    assurance: OrchestrationJob,
+    *,
+    evidence_ref: str | None = None,
+) -> None:
+    expected = _assert_assurance_recording_allowed(assurance)
     if assurance.source_delivery_job_id is not None:
         delivery = get_job(conn, assurance.source_delivery_job_id)
         current = delivery.candidate_git_sha
         if current and current != expected:
-            conn.execute(
-                """
-                UPDATE qa_evidence
-                SET result = 'stale_rejected', evidence_ref = ?
-                WHERE assurance_job_id = ? AND candidate_git_sha = ?
-                """,
-                (evidence_ref, assurance.id, expected),
+            from projectos.qa_evidence_policy import update_qa_evidence_result
+
+            update_qa_evidence_result(
+                conn,
+                assurance_job_id=assurance.id,
+                candidate_git_sha=expected,
+                new_result="stale_rejected",
+                evidence_ref=evidence_ref,
             )
             append_run_event(
                 conn,
@@ -197,15 +202,114 @@ def record_assurance_result(
                 f"Stale QA evidence for {expected}; delivery candidate is {current}"
             )
 
-    result = "pass" if passed else "fail"
+
+def record_invalid_assurance_result(
+    conn,
+    assurance: OrchestrationJob,
+    *,
+    reason: str,
+    evidence_ref: str | None = None,
+) -> str:
+    """Record malformed/missing structured verdict — never PASS."""
+    expected = _assert_assurance_recording_allowed(assurance)
+    try:
+        _reject_stale_assurance_evidence(conn, assurance, evidence_ref=evidence_ref)
+    except OrchestrationError:
+        raise
+
+    from projectos.domain_events import lookup_event_context_for_project
+    from projectos.qa_evidence_policy import update_qa_evidence_result
+    from projectos.qa_gate import emit_qa_gate_evaluation
+
+    update_qa_evidence_result(
+        conn,
+        assurance_job_id=assurance.id,
+        candidate_git_sha=expected,
+        new_result="inconclusive",
+        evidence_ref=evidence_ref,
+    )
+    append_run_event(
+        conn,
+        assurance.id,
+        "qa.assurance_result_invalid",
+        status="BLOCKED",
+        message=reason[:500],
+        payload={"reason": reason, "candidate_git_sha": expected},
+    )
+    event_ctx = lookup_event_context_for_project(conn, assurance.project_human_id)
+    if event_ctx is not None:
+        from projectos.domain_events import ACTOR_QA, emit_projectos_event
+
+        emit_projectos_event(
+            conn,
+            ctx=event_ctx,
+            event_type="ASSURANCE_RESULT_INVALID",
+            summary=f"Assurance result invalid for {assurance.queue}: {reason[:200]}",
+            actor_id=ACTOR_QA,
+            phase="QA_GATE",
+            detail_level="milestone",
+            evidence={
+                "assurance_role": assurance.queue,
+                "job_id": assurance.human_id,
+                "candidate_git_sha": expected,
+                "reason": reason,
+            },
+        )
+        emit_qa_gate_evaluation(
+            conn,
+            project_id=assurance.project_human_id,
+            event_context=event_ctx,
+        )
+    return "inconclusive"
+
+
+def record_assurance_verdict(
+    conn,
+    assurance: OrchestrationJob,
+    *,
+    result: AssuranceResult,
+    evidence_ref: str | None = None,
+    create_defect_fn=None,
+) -> str:
+    """Record validated assurance verdict — execution success is not implied."""
+    expected = _assert_assurance_recording_allowed(assurance)
+    _reject_stale_assurance_evidence(conn, assurance, evidence_ref=evidence_ref)
+
+    if result.candidate_id != expected:
+        raise OrchestrationError(
+            f"Candidate mismatch: result {result.candidate_id!r} != job {expected!r}"
+        )
+    if result.assurance_job_id != assurance.human_id:
+        raise OrchestrationError(
+            f"Job mismatch: result {result.assurance_job_id!r} != job {assurance.human_id!r}"
+        )
+    if result.assessor_role != assurance.queue:
+        raise OrchestrationError(
+            f"Role mismatch: result {result.assessor_role!r} != job {assurance.queue!r}"
+        )
+
+    evidence_result = verdict_to_evidence_result(result.verdict)
     from projectos.qa_evidence_policy import update_qa_evidence_result
 
     update_qa_evidence_result(
         conn,
         assurance_job_id=assurance.id,
         candidate_git_sha=expected,
-        new_result=result,
+        new_result=evidence_result,
         evidence_ref=evidence_ref,
+    )
+    append_run_event(
+        conn,
+        assurance.id,
+        "qa.assurance_result_recorded",
+        status="SUCCEEDED",
+        message=f"Assurance verdict {result.verdict} for {expected}",
+        payload={
+            "verdict": result.verdict,
+            "candidate_git_sha": expected,
+            "summary": result.summary,
+            "findings_count": len(result.findings),
+        },
     )
 
     from projectos.domain_events import lookup_event_context_for_project
@@ -213,16 +317,62 @@ def record_assurance_result(
 
     event_ctx = lookup_event_context_for_project(conn, assurance.project_human_id)
     if event_ctx is not None:
-        if not passed:
-            emit_qa_finding_created(
+        from projectos.domain_events import ACTOR_QA, emit_projectos_event
+
+        emit_projectos_event(
+            conn,
+            ctx=event_ctx,
+            event_type="ASSURANCE_RESULT_RECORDED",
+            summary=f"{assurance.queue} verdict {result.verdict} for {expected}",
+            actor_id=ACTOR_QA,
+            phase="QA_GATE",
+            detail_level="normal",
+            evidence={
+                "verdict": result.verdict,
+                "assurance_role": assurance.queue,
+                "job_id": assurance.human_id,
+                "candidate_git_sha": expected,
+                "summary": result.summary,
+            },
+        )
+        if result.verdict == VERDICT_FAIL:
+            for finding in result.findings:
+                emit_qa_finding_created(
+                    conn,
+                    event_context=event_ctx,
+                    summary=f"QA finding {finding.finding_id}: {finding.actual_condition}",
+                    evidence=finding.to_dict(),
+                )
+            if not result.findings:
+                emit_qa_finding_created(
+                    conn,
+                    event_context=event_ctx,
+                    summary=f"QA finding on {assurance.queue} for {expected}",
+                    evidence={
+                        "assurance_role": assurance.queue,
+                        "job_id": assurance.human_id,
+                        "candidate_git_sha": expected,
+                        "result": evidence_result,
+                        "summary": result.summary,
+                    },
+                )
+        elif result.verdict == VERDICT_INCONCLUSIVE:
+            emit_projectos_event(
                 conn,
-                event_context=event_ctx,
-                summary=f"QA finding on {assurance.queue} for {expected}",
+                ctx=event_ctx,
+                event_type="QA_INCONCLUSIVE",
+                summary=(
+                    f"Assurance {assurance.queue} inconclusive for {expected}: "
+                    f"{result.summary or 'assessment could not determine compliance'}"
+                ),
+                actor_id=ACTOR_QA,
+                phase="QA_GATE",
+                detail_level="milestone",
                 evidence={
                     "assurance_role": assurance.queue,
                     "job_id": assurance.human_id,
                     "candidate_git_sha": expected,
-                    "result": result,
+                    "summary": result.summary,
                 },
             )
         emit_qa_gate_evaluation(
@@ -231,15 +381,14 @@ def record_assurance_result(
             event_context=event_ctx,
         )
 
-    if not passed:
+    if result.verdict == VERDICT_FAIL:
         defect_id = None
         if create_defect_fn is not None:
             defect_out = create_defect_fn(
                 Path(assurance.repository_root),
                 title=f"QA failure on {assurance.queue} for {expected}",
-                description=f"Assurance job {assurance.human_id} failed",
+                description=f"Assurance job {assurance.human_id} failed: {result.summary}",
             )
-            # parse Created BUG-…
             for line in (defect_out.stdout or "").splitlines():
                 if "Created" in line:
                     parts = line.split()
@@ -278,12 +427,73 @@ def record_assurance_result(
             message="Blocking QA failure; rework created",
             payload={"rework_job": rework_id, "defect": defect_id},
         )
+    return evidence_result
+
+
+def process_assurance_worker_success(
+    conn,
+    assurance: OrchestrationJob,
+    *,
+    stdout: str | None,
+    evidence_ref: str | None = None,
+    create_defect_fn=None,
+) -> str:
+    """Parse structured worker output after successful execution — never auto-PASS."""
+    try:
+        validated = parse_and_validate_assurance_result(stdout, assurance)
+    except AssuranceValidationError as exc:
+        return record_invalid_assurance_result(
+            conn,
+            assurance,
+            reason=str(exc),
+            evidence_ref=evidence_ref,
+        )
+    return record_assurance_verdict(
+        conn,
+        assurance,
+        result=validated,
+        evidence_ref=evidence_ref,
+        create_defect_fn=create_defect_fn,
+    )
+
+
+def record_assurance_result(
+    conn,
+    assurance: OrchestrationJob,
+    *,
+    passed: bool | None = None,
+    verdict: str | None = None,
+    evidence_ref: str | None = None,
+    create_defect_fn=None,
+    summary: str = "",
+    findings: list | None = None,
+) -> None:
+    """Backward-compatible wrapper — prefer record_assurance_verdict in new code."""
+    _assert_assurance_recording_allowed(assurance)
+    if verdict is None:
+        if passed is None:
+            raise OrchestrationError("record_assurance_result requires verdict or passed")
+        verdict = VERDICT_PASS if passed else VERDICT_FAIL
+    from projectos.assurance_verdict import assurance_result_for_test
+
+    result = assurance_result_for_test(
+        verdict=verdict,
+        assurance=assurance,
+        summary=summary or f"legacy verdict {verdict}",
+        findings=findings,
+    )
+    record_assurance_verdict(
+        conn,
+        assurance,
+        result=result,
+        evidence_ref=evidence_ref,
+        create_defect_fn=create_defect_fn,
+    )
 
 
 def maybe_handoff_after_delivery(conn, job: OrchestrationJob) -> HandoffResult | None:
     if not is_valid_qa_candidate(job):
         return None
-    # Avoid duplicate handoff
     existing = conn.execute(
         """
         SELECT COUNT(*) FROM qa_evidence WHERE delivery_job_id = ?

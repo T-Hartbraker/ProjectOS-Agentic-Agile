@@ -28,7 +28,7 @@ from projectos.migrate import initialize_database
 from projectos.paths import DEFAULT_DB_PATH, DEFAULT_REGISTRY_PATH
 from projectos.projectctl_bridge import create_defect, resolve_validated_repo
 from projectos.prompt_builder import build_role_prompt, resolve_delivery_assignment
-from projectos.qa_handoff import maybe_handoff_after_delivery, record_assurance_result
+from projectos.qa_handoff import maybe_handoff_after_delivery, process_assurance_worker_success
 from projectos.release_provenance import (
     bind_dependent_release_jobs,
     bind_release_provenance,
@@ -505,17 +505,6 @@ def run_once(
                 error=detail,
                 output_ref=cursor_result.output_ref,
             )
-            if final.queue in ASSURANCE_QUEUES and final.source_candidate_sha:
-                try:
-                    record_assurance_result(
-                        conn,
-                        final,
-                        passed=False,
-                        evidence_ref=cursor_result.output_ref,
-                        create_defect_fn=create_defect,
-                    )
-                except Exception:
-                    pass
             return WorkerResult(
                 status=final.status.lower(),
                 job_human_id=job_human,
@@ -554,15 +543,6 @@ def run_once(
                     f"delivery candidate is {delivery.candidate_git_sha}"
                 )
                 final = record_worker_failure(conn, job_id, error=msg, blocked=True)
-                try:
-                    record_assurance_result(
-                        conn,
-                        get_job(conn, job_id),
-                        passed=False,
-                        evidence_ref=cursor_result.output_ref,
-                    )
-                except Exception:
-                    pass
                 return WorkerResult(
                     status="blocked",
                     job_human_id=job_human,
@@ -700,11 +680,12 @@ def run_once(
         elif final.queue == "INTEGRATION":
             bind_dependent_release_jobs(conn, final)
         elif final.queue in ASSURANCE_QUEUES and final.source_candidate_sha:
-            record_assurance_result(
+            process_assurance_worker_success(
                 conn,
                 final,
-                passed=True,
+                stdout=cursor_result.stdout,
                 evidence_ref=cursor_result.output_ref,
+                create_defect_fn=create_defect,
             )
             promote_eligible_release_jobs(
                 conn,
