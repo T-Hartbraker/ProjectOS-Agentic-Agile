@@ -174,10 +174,10 @@ def attempt_delivery_contract_remediation(
         conn,
         ctx=event_ctx,
         event_type="AGENT_ASSIGNED",
-        summary="Assigned: delivery-agent to apply governed delivery contract.",
+        summary="Assigned: projectos-system to apply governed delivery contract.",
         actor_id=ACTOR_PM,
         phase="RELEASE_PREPARATION",
-        metadata={"agent_id": ACTOR_DELIVERY},
+        metadata={"agent_id": "projectos-system", "capability": "delivery-contract"},
     )
     try:
         contract_path = apply_governed_delivery_contract(repo_root, draft)
@@ -191,11 +191,11 @@ def attempt_delivery_contract_remediation(
     emit_projectos_event(
         conn,
         ctx=event_ctx,
-        event_type="WORK_COMPLETED",
+        event_type="DELIVERY_CONTRACT_APPLIED",
         summary="Governed delivery contract applied.",
-        actor_id=ACTOR_DELIVERY,
+        actor_id=ACTOR_PM,
         phase="RELEASE_PREPARATION",
-        evidence={"contract_path": str(contract_path)},
+        evidence={"contract_path": str(contract_path), "capability": "projectos-system"},
     )
     return DeliveryRemediationResult(
         recovered=True,
