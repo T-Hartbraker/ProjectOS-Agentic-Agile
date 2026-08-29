@@ -13,6 +13,12 @@ from projectos.slack_socket import post_message
 PROJECTOS_PREFIX = "*ProjectOS:*"
 
 
+def _claim_expiry_sql() -> str:
+    return (
+        "datetime(replace(replace(claim_expires_at, 'T', ' '), 'Z', '')) < datetime('now')"
+    )
+
+
 def list_pending_subscriber_outbox(
     conn,
     *,
@@ -43,12 +49,13 @@ def claim_pending_outbox(
         datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
     ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     conn.execute(
-        """
+        f"""
         UPDATE event_outbox
-        SET status = 'pending', claimed_by = NULL, claim_expires_at = NULL
+        SET status = 'pending', claimed_by = NULL, claim_expires_at = NULL,
+            blocked_by_outbox_id = NULL
         WHERE subscriber = ? AND status = 'claimed'
           AND claim_expires_at IS NOT NULL
-          AND claim_expires_at < datetime('now')
+          AND {_claim_expiry_sql()}
         """,
         (subscriber,),
     )
@@ -73,7 +80,7 @@ def mark_subscriber_delivered(conn, *, outbox_id: int) -> None:
         """
         UPDATE event_outbox
         SET status = 'delivered', delivered_at = datetime('now'),
-            claimed_by = NULL, claim_expires_at = NULL
+            claimed_by = NULL, claim_expires_at = NULL, blocked_by_outbox_id = NULL
         WHERE id = ?
         """,
         (outbox_id,),
@@ -105,6 +112,36 @@ def mark_subscriber_failed(conn, *, outbox_id: int, error: str) -> None:
         """,
         (str(error or "")[:500], outbox_id),
     )
+
+
+def mark_subscriber_blocked(
+    conn, *, outbox_id: int, blocked_by_outbox_id: int, error: str
+) -> None:
+    """Causal ordering hold — does not increment delivery attempts."""
+    conn.execute(
+        """
+        UPDATE event_outbox
+        SET status = 'blocked',
+            blocked_by_outbox_id = ?,
+            last_error = ?,
+            claimed_by = NULL,
+            claim_expires_at = NULL
+        WHERE id = ?
+        """,
+        (blocked_by_outbox_id, str(error or "")[:500], outbox_id),
+    )
+
+
+def release_blocked_outbox(conn, *, blocked_by_outbox_id: int) -> int:
+    cur = conn.execute(
+        """
+        UPDATE event_outbox
+        SET status = 'pending', blocked_by_outbox_id = NULL, last_error = NULL
+        WHERE blocked_by_outbox_id = ? AND status = 'blocked'
+        """,
+        (blocked_by_outbox_id,),
+    )
+    return int(cur.rowcount)
 
 
 def _should_project(payload: dict[str, Any], sponsor_level: str) -> bool:
@@ -149,6 +186,7 @@ def dispatch_event_outbox(
     delivered = 0
     failed = 0
     unroutable = 0
+    blocked = 0
     with connection(db_path) as conn:
         sponsor_level = get_activity_detail_level(conn)
         pending = claim_pending_outbox(
@@ -156,18 +194,22 @@ def dispatch_event_outbox(
         )
         conn.commit()
 
-    blocked_streams: set[str] = set()
+    blocked_streams: dict[str, int] = {}
     for row in pending:
         outbox_id = int(row["id"])
+        payload = {}
         try:
             payload = json.loads(str(row["payload_json"] or "{}"))
             stream = _stream_key(payload, subscriber)
             if stream in blocked_streams:
                 with connection(db_path) as conn:
-                    mark_subscriber_failed(
-                        conn, outbox_id=outbox_id, error="causal ordering hold"
+                    mark_subscriber_blocked(
+                        conn,
+                        outbox_id=outbox_id,
+                        blocked_by_outbox_id=blocked_streams[stream],
+                        error="causal ordering hold",
                     )
-                failed += 1
+                blocked += 1
                 continue
             if subscriber == "slack":
                 if not _should_project(payload, sponsor_level):
@@ -196,13 +238,20 @@ def dispatch_event_outbox(
                 )
             with connection(db_path) as conn:
                 mark_subscriber_delivered(conn, outbox_id=outbox_id)
+                release_blocked_outbox(conn, blocked_by_outbox_id=outbox_id)
             delivered += 1
         except Exception as exc:  # noqa: BLE001
             with connection(db_path) as conn:
                 mark_subscriber_failed(conn, outbox_id=outbox_id, error=str(exc))
-            blocked_streams.add(_stream_key(payload, subscriber))
+            if payload:
+                blocked_streams[_stream_key(payload, subscriber)] = outbox_id
             failed += 1
-    return {"delivered": delivered, "failed": failed, "unroutable": unroutable}
+    return {
+        "delivered": delivered,
+        "failed": failed,
+        "unroutable": unroutable,
+        "blocked": blocked,
+    }
 
 
 def outbox_diagnostics(conn) -> dict[str, int]:
@@ -210,7 +259,6 @@ def outbox_diagnostics(conn) -> dict[str, int]:
         """
         SELECT status, COUNT(*) AS cnt
         FROM event_outbox
-        WHERE subscriber = 'slack'
         GROUP BY status
         """
     ).fetchall()

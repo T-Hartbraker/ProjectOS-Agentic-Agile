@@ -351,14 +351,15 @@ def _run_qa_with_remediation_impl(
         if gate == "PASSED":
             return RemediationResult(gate=gate, remediation_cycles=cycles, findings=())
         if gate == "INCONCLUSIVE":
-            emit_projectos_event(
+            from projectos.qa_inconclusive import schedule_assurance_retry_for_inconclusive
+
+            schedule_assurance_retry_for_inconclusive(
                 conn,
-                ctx=event_ctx,
-                event_type="ASSURANCE_RETRY_SCHEDULED",
-                summary="PM scheduled assurance retry for inconclusive QA gate.",
-                actor_id=ACTOR_PM,
-                phase="QA_GATE",
-                evidence={"qa": facts, "candidate_git_sha": candidate},
+                event_ctx=event_ctx,
+                project_id=project_id,
+                repository_root=repository_root,
+                candidate_git_sha=candidate or "",
+                run_id=event_ctx.run_id or "",
             )
             assert_run_has_next_action(
                 conn, run_id=event_ctx.run_id, project_id=project_id

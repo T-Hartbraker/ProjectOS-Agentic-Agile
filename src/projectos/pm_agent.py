@@ -746,6 +746,8 @@ def _orchestrate_release_capability_impl(
     except OrchestrationError as exc:
         failure = orchestration_blocker_from_message(str(exc), repo_root=repo_root)
         with connection(ctx.db_path) as block_conn:
+            from projectos.release_failure_actions import ensure_package_failure_next_action
+
             emit_projectos_event(
                 block_conn,
                 ctx=event_ctx,
@@ -757,10 +759,19 @@ def _orchestrate_release_capability_impl(
                 detail_level="milestone",
                 evidence=failure,
             )
+            ensure_package_failure_next_action(
+                block_conn,
+                event_ctx=event_ctx,
+                project_id=project_id,
+                repository_root=str(repo_root.resolve()) if repo_root else "/repo",
+                failure=failure,
+                release_record_id=release_record_id,
+                service_ctx=ctx,
+            )
         return (
             f"*ProjectOS PM — PACKAGE FAILED*\n"
             f"Run: `{event_ctx.run_id}`\n"
-            "PM is managing remediation; run remains active."
+            "PM scheduled durable package remediation."
         )
 
     stub_installer = adapter_id == "python_desktop"
@@ -810,6 +821,8 @@ def _orchestrate_release_capability_impl(
         published_url = published.get("github_release_url") or published.get("download_url")
     except OrchestrationError as pub_exc:
         with connection(ctx.db_path) as pub_conn:
+            from projectos.release_failure_actions import ensure_publication_failure_next_action
+
             emit_projectos_event(
                 pub_conn,
                 ctx=event_ctx,
@@ -821,11 +834,19 @@ def _orchestrate_release_capability_impl(
                 detail_level="milestone",
                 evidence={"release_record_id": release_record_id, "reason": str(pub_exc)[:500]},
             )
+            ensure_publication_failure_next_action(
+                pub_conn,
+                event_ctx=event_ctx,
+                project_id=project_id,
+                repository_root=str(repo_root.resolve()) if repo_root else "/repo",
+                failure={"blocker_type": "PUBLICATION_FAILED", "reason": str(pub_exc)},
+                release_record_id=release_record_id,
+            )
         return (
             f"*ProjectOS PM — PUBLICATION FAILED*\n"
             f"Run: `{event_ctx.run_id}`\n"
             f"Release: `{release_human_id}`\n"
-            "PM is managing remediation; run remains active."
+            "PM scheduled durable publication retry."
         )
 
     return _format_release_evidence(

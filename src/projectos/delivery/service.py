@@ -113,6 +113,11 @@ def _resolve_repo_root(ctx: ServiceContext, project_human_id: str) -> Path:
     return Path(entry.repository_root).resolve()
 
 
+def _distributable_artifacts(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    types = frozenset({"installer", "installer_placeholder", "zip", "package", "binary"})
+    return [row for row in artifacts if str(row["artifact_type"]) in types]
+
+
 class DeliveryService:
     def __init__(
         self,
@@ -498,22 +503,26 @@ class DeliveryService:
             repo_root = _resolve_repo_root(self.ctx, project_human_id)
             contract = load_delivery_contract(repo_root)
             artifacts = list_delivery_artifacts(conn, release_record_id)
+            distributables = _distributable_artifacts(artifacts)
+            if not distributables:
+                raise OrchestrationError("No distributable artifacts found for verification")
+            for artifact in distributables:
+                path = Path(str(artifact["local_build_path"]))
+                if not path.is_file():
+                    raise OrchestrationError(f"Artifact file missing: {artifact['artifact_name']}")
+                actual = _sha256_file(path)
+                if actual != artifact["sha256"]:
+                    upsert_gate_status(
+                        conn,
+                        release_record_id=release_record_id,
+                        gate_name="CHECKSUM_GATE",
+                        status=GATE_STATUS_FAILED,
+                        detail=f"Checksum mismatch: {artifact['artifact_name']}",
+                    )
+                    raise OrchestrationError(f"Artifact checksum mismatch: {artifact['artifact_name']}")
             installer = _primary_distributable_artifact(artifacts)
             if installer is None:
-                raise OrchestrationError("No distributable artifact found for verification")
-            path = Path(str(installer["local_build_path"]))
-            if not path.is_file():
-                raise OrchestrationError("Installer artifact file is missing on disk")
-            actual = _sha256_file(path)
-            if actual != installer["sha256"]:
-                upsert_gate_status(
-                    conn,
-                    release_record_id=release_record_id,
-                    gate_name="CHECKSUM_GATE",
-                    status=GATE_STATUS_FAILED,
-                    detail="Checksum mismatch during verification",
-                )
-                raise OrchestrationError("Artifact checksum mismatch")
+                installer = distributables[0]
             manifest = build_release_manifest(
                 project_id=project_human_id,
                 release_id=str(record["release_human_id"]),
@@ -540,7 +549,7 @@ class DeliveryService:
                 expected_git_sha=str(record["candidate_git_sha"]),
                 expected_artifact_sha256=installer["sha256"],
             )
-            manifest_path = path.parent / "release-manifest.json"
+            manifest_path = Path(str(installer["local_build_path"])).parent / "release-manifest.json"
             manifest_bytes = manifest_json(manifest).encode("utf-8")
             manifest_path.write_bytes(manifest_bytes)
             manifest_sha = _sha256_bytes(manifest_bytes)
@@ -592,9 +601,8 @@ class DeliveryService:
             contract = load_delivery_contract(repo_root)
             announce_enabled = contract.slack_release_announcement_enabled
             gates = list_gate_statuses(conn, release_record_id)
-            if gates.get("VERIFY_GATE") not in {GATE_STATUS_PASSED, GATE_STATUS_NOT_REQUIRED, None}:
-                if gates.get("VERIFY_GATE") != GATE_STATUS_PASSED:
-                    raise OrchestrationError("Release verification required before publication")
+            if gates.get("VERIFY_GATE") != GATE_STATUS_PASSED:
+                raise OrchestrationError("Release verification required before publication")
             if gates.get("SIGNATURE_GATE") == GATE_STATUS_FAILED:
                 raise OrchestrationError("Signature gate failed; publication blocked")
             if gates.get("SIGNATURE_GATE") == GATE_STATUS_PENDING and contract.code_signing_policy == "required_for_production":
