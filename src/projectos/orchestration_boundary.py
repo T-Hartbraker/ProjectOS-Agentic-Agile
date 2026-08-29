@@ -31,6 +31,9 @@ def run_with_internal_defect_routing(
     operation: str,
     fn: Callable[[], T],
     in_project_scope: bool = False,
+    service_ctx=None,
+    worker=None,
+    repository_root: str | None = None,
 ) -> T:
     """Execute orchestration work and route internal ProjectOS defects to PM policy."""
     try:
@@ -48,6 +51,9 @@ def run_with_internal_defect_routing(
             operation=operation,
             project_id=project_id,
             in_project_scope=in_project_scope,
+            service_ctx=service_ctx,
+            worker=worker,
+            repository_root=repository_root,
         )
         raise OrchestrationError(
             f"Internal defect in {component}.{operation}: {type(exc).__name__}: {exc}"

@@ -47,18 +47,19 @@ def handle_internal_defect(
     )
     if in_project_scope:
         from projectos.remediation_executor import execute_remediation_work
-        from projectos.remediation_store import create_remediation_work
+        from projectos.remediation_store import count_remediation_cycles, create_remediation_work
         from projectos.registry import load_registry
         from projectos.paths import DEFAULT_REGISTRY_PATH
 
         registry = load_registry(DEFAULT_REGISTRY_PATH)
         entry = registry.get(project_id)
         repo_root = repository_root or (str(entry.repository_root) if entry else "")
+        cycle = count_remediation_cycles(conn, run_id=event_ctx.run_id or project_id) + 1
         work = create_remediation_work(
             conn,
             run_id=event_ctx.run_id or project_id,
             project_id=project_id,
-            remediation_cycle=1,
+            remediation_cycle=cycle,
             finding_ids=["INTERNAL-DEFECT"],
             assigned_agent="developer-agent",
             objective=f"Fix internal defect: {evidence['message'][:200]}",
@@ -69,7 +70,7 @@ def handle_internal_defect(
             findings=[evidence],
         )
         evidence["remediation_work_item_id"] = work.work_item_id
-        execute_remediation_work(
+        outcome = execute_remediation_work(
             conn,
             work=work,
             event_ctx=event_ctx,
@@ -78,6 +79,20 @@ def handle_internal_defect(
             service_ctx=service_ctx,
             worker=worker,
         )
+        if outcome.status == "COMPLETED" and outcome.target_candidate_id:
+            from projectos.qa_retest import execute_qa_retest
+
+            execute_qa_retest(
+                conn,
+                event_ctx=event_ctx,
+                project_id=project_id,
+                repository_root=repo_root or "/",
+                candidate_id=outcome.target_candidate_id,
+                run_id=event_ctx.run_id,
+                remediation_cycle=cycle,
+                source_remediation_job_id=work.orchestration_job_id,
+                service_ctx=service_ctx,
+            )
         return evidence
 
     emit_projectos_event(
