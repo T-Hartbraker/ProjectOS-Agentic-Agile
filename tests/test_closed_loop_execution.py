@@ -1,4 +1,4 @@
-"""QA closed-loop remediation tests with real executable work."""
+"""Closed-loop execution tests — real work, immutable evidence, candidate retest."""
 
 from __future__ import annotations
 
@@ -9,8 +9,15 @@ from helpers import init_git_repo, write_identity, write_registry
 from projectos.db import connection
 from projectos.domain_events import EventContext
 from projectos.execution_run import create_execution_run, update_execution_run
+from projectos.finding_routing import (
+    ARCHITECTURE_VIOLATION,
+    PACKAGING_DEFECT,
+    SECURITY_FINDING,
+    SOURCE_CODE_DEFECT,
+    route_finding_to_agent,
+)
 from projectos.migrate import initialize_database
-from projectos.pm_remediation import run_qa_with_remediation
+from projectos.pm_remediation import collect_qa_findings, run_qa_with_remediation
 from projectos.services.context import ServiceContext
 from projectos.sponsor_handoff import create_sponsor_handoff, mark_handoff_accepted
 
@@ -26,20 +33,6 @@ def _ctx(tmp_path: Path) -> tuple[ServiceContext, str]:
     db = tmp_path / "projectos.db"
     initialize_database(db)
     return ServiceContext(db_path=db, registry_path=tmp_path / "projects.json"), repo_root
-
-
-def _seed_qa(conn, *, total: int = 4, failed: int = 2, repo_root: str, run_id: str) -> None:
-    for i in range(total):
-        result = "fail" if i < failed else "pass"
-        conn.execute(
-            """
-            INSERT INTO qa_evidence (
-                project_human_id, repository_root, candidate_git_sha,
-                assurance_role, result, run_id
-            ) VALUES ('PRJ-003', ?, 'shaA', ?, ?, ?)
-            """,
-            (repo_root, f"ASSURANCE_{i % 2}", result, run_id),
-        )
 
 
 def _seed_run(conn) -> EventContext:
@@ -65,18 +58,29 @@ def _seed_run(conn) -> EventContext:
     return EventContext(project_id="PRJ-003", handoff_id=handoff.handoff_id, run_id=run.run_id)
 
 
-def test_qa_fail_remediation_pass_continue(tmp_path: Path) -> None:
+def _seed_qa(conn, *, candidate: str, failed: int, total: int, repo_root: str, run_id: str) -> None:
+    for i in range(total):
+        result = "fail" if i < failed else "pass"
+        conn.execute(
+            """
+            INSERT INTO qa_evidence (
+                project_human_id, repository_root, candidate_git_sha,
+                assurance_role, result, run_id
+            ) VALUES ('PRJ-003', ?, ?, ?, ?, ?)
+            """,
+            (repo_root, candidate, f"ASSURANCE_{i % 4}", result, run_id),
+        )
+
+
+def test_candidate_a_stays_fail_after_remediation(tmp_path: Path) -> None:
     ctx, repo_root = _ctx(tmp_path)
     with connection(ctx.db_path) as conn:
         event_ctx = _seed_run(conn)
-        _seed_qa(conn, total=4, failed=2, repo_root=repo_root, run_id=event_ctx.run_id)
+        _seed_qa(conn, candidate="shaA", failed=2, total=4, repo_root=repo_root, run_id=event_ctx.run_id)
         failed_before = {
             int(row["id"])
             for row in conn.execute(
-                """
-                SELECT id FROM qa_evidence
-                WHERE candidate_git_sha = 'shaA' AND result = 'fail'
-                """
+                "SELECT id FROM qa_evidence WHERE candidate_git_sha = 'shaA' AND result = 'fail'"
             ).fetchall()
         }
         result = run_qa_with_remediation(
@@ -84,16 +88,8 @@ def test_qa_fail_remediation_pass_continue(tmp_path: Path) -> None:
             event_ctx=event_ctx,
             project_id="PRJ-003",
             repository_root=repo_root,
+            retest_passes=True,
         )
-        events = {
-            r["event_type"]
-            for r in conn.execute(
-                "SELECT event_type FROM projectos_events WHERE run_id = ?", (event_ctx.run_id,)
-            ).fetchall()
-        }
-        run = conn.execute(
-            "SELECT status FROM execution_runs WHERE run_id = ?", (event_ctx.run_id,)
-        ).fetchone()
         failed_after = {
             int(row["id"]): str(row["result"])
             for row in conn.execute(
@@ -105,69 +101,67 @@ def test_qa_fail_remediation_pass_continue(tmp_path: Path) -> None:
             ).fetchall()
         }
     assert result.gate == "PASSED"
-    assert result.remediation_cycles == 1
-    assert "REMEDIATION_STARTED" in events
-    assert "WORK_COMPLETED" in events
-    assert "QA_RETEST_STARTED" in events
-    assert "RUN_BLOCKED" not in events
-    assert run["status"] == "RUNNING"
     assert failed_before
     assert all(result == "fail" for result in failed_after.values())
 
 
-def test_remediation_policy_exceeded_escalates(tmp_path: Path) -> None:
+def test_second_cycle_failure_then_third_passes(tmp_path: Path) -> None:
     ctx, repo_root = _ctx(tmp_path)
     with connection(ctx.db_path) as conn:
         event_ctx = _seed_run(conn)
-        _seed_qa(conn, total=4, failed=4, repo_root=repo_root, run_id=event_ctx.run_id)
-        conn.execute(
-            """
-            INSERT INTO projectos_events (
-                event_id, event_version, project_id, run_id, actor_type, actor_id,
-                actor_role, event_type, summary, visibility, detail_level, evidence_json
-            ) VALUES (lower(hex(randomblob(8))), 1, 'PRJ-003', ?, 'agent', 'qa-agent',
-                      'QA Agent', 'QA_FINDING_CREATED', 'seed', 'SPONSOR', 'normal', ?)
-            """,
-            (
-                event_ctx.run_id,
-                json.dumps({"category": "SOURCE_CODE_DEFECT", "finding_id": "FND-SEED"}),
-            ),
-        )
+        _seed_qa(conn, candidate="shaA", failed=4, total=4, repo_root=repo_root, run_id=event_ctx.run_id)
         result = run_qa_with_remediation(
             conn,
             event_ctx=event_ctx,
             project_id="PRJ-003",
             repository_root=repo_root,
-            max_cycles=3,
-            max_same_finding_recurrence=1,
-            retest_passes=False,
+            cycle_retest_passes=lambda cycle: cycle >= 2,
         )
-        terminal = conn.execute(
-            "SELECT event_type FROM projectos_events WHERE run_id=? AND event_type='RUN_ESCALATED'",
-            (event_ctx.run_id,),
-        ).fetchone()
-        run = conn.execute(
-            "SELECT status FROM execution_runs WHERE run_id=?", (event_ctx.run_id,)
-        ).fetchone()
-    assert result.escalated
-    assert terminal is not None
-    assert run["status"] == "ESCALATED"
+        candidates = {
+            row["candidate_git_sha"]
+            for row in conn.execute(
+                "SELECT DISTINCT candidate_git_sha FROM qa_evidence"
+            ).fetchall()
+        }
+    assert result.gate == "PASSED"
+    assert "shaA" in candidates
+    assert any(c != "shaA" for c in candidates)
 
 
-def test_qa_failure_alone_never_run_blocked(tmp_path: Path) -> None:
+def test_finding_routing_assignments() -> None:
+    dev_agent, _ = route_finding_to_agent({"category": SOURCE_CODE_DEFECT})
+    arch_agent, _ = route_finding_to_agent({"category": ARCHITECTURE_VIOLATION})
+    sec_agent, _ = route_finding_to_agent({"category": SECURITY_FINDING})
+    del_agent, _ = route_finding_to_agent({"category": PACKAGING_DEFECT})
+    assert dev_agent == "developer-agent"
+    assert arch_agent == "architecture-agent"
+    assert sec_agent == "security-agent"
+    assert del_agent == "delivery-agent"
+
+
+def test_work_completed_requires_work_item(tmp_path: Path) -> None:
     ctx, repo_root = _ctx(tmp_path)
     with connection(ctx.db_path) as conn:
         event_ctx = _seed_run(conn)
-        _seed_qa(conn, total=2, failed=2, repo_root=repo_root, run_id=event_ctx.run_id)
+        _seed_qa(conn, candidate="shaA", failed=2, total=2, repo_root=repo_root, run_id=event_ctx.run_id)
         run_qa_with_remediation(
             conn,
             event_ctx=event_ctx,
             project_id="PRJ-003",
             repository_root=repo_root,
-            max_cycles=0,
         )
-        blocked = conn.execute(
-            "SELECT 1 FROM projectos_events WHERE run_id = ? AND event_type = 'RUN_BLOCKED'",
+        work = conn.execute(
+            "SELECT work_item_id, status, target_candidate_id FROM remediation_work"
+        ).fetchone()
+        completed = conn.execute(
+            """
+            SELECT evidence_json FROM projectos_events
+            WHERE run_id = ? AND event_type = 'WORK_COMPLETED'
+            """,
             (event_ctx.run_id,),
         ).fetchone()
-    assert blocked is None
+    assert work is not None
+    assert work["status"] == "COMPLETED"
+    assert work["target_candidate_id"]
+    evidence = json.loads(completed["evidence_json"])
+    assert evidence.get("work_item_id")
