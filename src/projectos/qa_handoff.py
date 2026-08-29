@@ -198,13 +198,14 @@ def record_assurance_result(
             )
 
     result = "pass" if passed else "fail"
-    conn.execute(
-        """
-        UPDATE qa_evidence
-        SET result = ?, evidence_ref = ?
-        WHERE assurance_job_id = ? AND candidate_git_sha = ?
-        """,
-        (result, evidence_ref, assurance.id, expected),
+    from projectos.qa_evidence_policy import update_qa_evidence_result
+
+    update_qa_evidence_result(
+        conn,
+        assurance_job_id=assurance.id,
+        candidate_git_sha=expected,
+        new_result=result,
+        evidence_ref=evidence_ref,
     )
 
     from projectos.domain_events import lookup_event_context_for_project
