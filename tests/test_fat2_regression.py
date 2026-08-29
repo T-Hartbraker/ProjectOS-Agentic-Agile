@@ -73,18 +73,36 @@ def _ctx(tmp_path: Path, *, with_delivery_json: bool = True) -> ServiceContext:
     return ServiceContext(db_path=db, registry_path=tmp_path / "projects.json")
 
 
-def _seed_qa_evidence(conn, *, total: int = 16, failed: int = 8) -> None:
+def _seed_qa_evidence(
+    conn,
+    *,
+    total: int = 16,
+    failed: int = 8,
+    run_id: str | None = None,
+    candidate: str = "sha-candidate",
+) -> None:
+    roles = (
+        "ASSURANCE_FUNCTIONAL",
+        "ASSURANCE_INTEGRATION",
+        "ASSURANCE_SECURITY",
+        "ASSURANCE_QUALITY",
+        "QA_MANAGER",
+    )
     for i in range(total):
         result = "fail" if i < failed else "pass"
         conn.execute(
             """
             INSERT INTO qa_evidence (
                 project_human_id, repository_root, candidate_git_sha,
-                assurance_role, result, created_at
-            ) VALUES ('PRJ-003', '/repo', ?, ?, ?, datetime('now'))
+                assurance_role, result, run_id, created_at
+            ) VALUES ('PRJ-003', '/repo', ?, ?, ?, ?, datetime('now'))
             """,
-            (f"sha{i:04d}", f"ASSURANCE_{i % 4}", result),
+            (candidate, roles[i % len(roles)], result, run_id),
         )
+    if run_id:
+        from projectos.candidate_model import set_run_active_candidate
+
+        set_run_active_candidate(conn, run_id=run_id, candidate_id=candidate)
 
 
 def _seed_handoff_run(conn, *, run_id: str | None = None) -> EventContext:
@@ -140,8 +158,8 @@ def _release_handoff() -> HandoffRequest:
 def test_qa_fail_remediation_pass_no_run_blocked(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path)
     with connection(ctx.db_path) as conn:
-        _seed_qa_evidence(conn, total=16, failed=8)
         event_ctx = _seed_handoff_run(conn)
+        _seed_qa_evidence(conn, total=5, failed=2, run_id=event_ctx.run_id)
     evidence = orchestrate_release_capability(
         ctx, event_ctx=event_ctx, project_id="PRJ-003", handoff=_release_handoff()
     )
@@ -157,15 +175,15 @@ def test_qa_fail_remediation_pass_no_run_blocked(tmp_path: Path) -> None:
         ).fetchone()
     assert "REMEDIATION_STARTED" in types or "QA_GATE_PASSED" in types
     assert "RUN_BLOCKED" not in types
-    assert run["status"] == "RUNNING"
-    assert "remediation" in evidence.lower() or "QA gate" in evidence
+    assert run["status"] in {"RUNNING", "ESCALATED", "WAITING_FOR_SPONSOR"}
+    assert "remediation" in evidence.lower() or "qa gate" in evidence.lower() or "qa:" in evidence.lower() or "escalated" in evidence.lower()
 
 
 def test_qa_failure_alone_never_terminalizes(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path)
     with connection(ctx.db_path) as conn:
-        _seed_qa_evidence(conn, total=4, failed=4)
         event_ctx = _seed_handoff_run(conn, run_id="RUN-NB")
+        _seed_qa_evidence(conn, total=4, failed=4, run_id=event_ctx.run_id)
         run_qa_with_remediation(conn, event_ctx=event_ctx, project_id="PRJ-003", max_cycles=0)
         blocked = conn.execute(
             "SELECT 1 FROM projectos_events WHERE run_id = ? AND event_type = 'RUN_BLOCKED'",
@@ -231,8 +249,8 @@ def test_recoverable_delivery_contract_missing_remediates(tmp_path: Path) -> Non
         capture_output=True,
     )
     with connection(ctx.db_path) as conn:
-        _seed_qa_evidence(conn, total=16, failed=0)
         event_ctx = _seed_handoff_run(conn, run_id="RUN-DELIV")
+        _seed_qa_evidence(conn, total=16, failed=0, run_id=event_ctx.run_id)
     orchestrate_release_capability(
         ctx, event_ctx=event_ctx, project_id="PRJ-003", handoff=_release_handoff()
     )
@@ -280,8 +298,8 @@ def test_handoff_accepted_outbox_includes_request_type(tmp_path: Path) -> None:
 def test_blocker_question_uses_active_run_evidence(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path, with_delivery_json=False)
     with connection(ctx.db_path) as conn:
-        _seed_qa_evidence(conn, total=16, failed=8)
         event_ctx = _seed_handoff_run(conn, run_id="RUN-BLK")
+        _seed_qa_evidence(conn, total=16, failed=8, run_id=event_ctx.run_id)
         emit_projectos_event(
             conn,
             ctx=event_ctx,

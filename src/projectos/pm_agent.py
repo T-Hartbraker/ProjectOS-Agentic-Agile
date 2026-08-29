@@ -524,6 +524,7 @@ def orchestrate_release_capability(
 ) -> str:
     from projectos.orchestration_boundary import run_with_internal_defect_routing
 
+    repo_root = _resolve_repo_root(ctx, project_id)
     with connection(ctx.db_path) as conn:
         return run_with_internal_defect_routing(
             conn,
@@ -532,6 +533,8 @@ def orchestrate_release_capability(
             component="pm_agent",
             operation="orchestrate_release_capability",
             in_project_scope=True,
+            service_ctx=ctx,
+            repository_root=str(repo_root.resolve()) if repo_root else None,
             fn=lambda: _orchestrate_release_capability_impl(
                 ctx,
                 event_ctx=event_ctx,
@@ -614,6 +617,11 @@ def _orchestrate_release_capability_impl(
         )
 
     with connection(ctx.db_path) as prep_conn:
+        from projectos.candidate_model import latest_candidate_sha
+
+        approved_candidate = latest_candidate_sha(
+            prep_conn, project_id=project_id, run_id=event_ctx.run_id
+        )
         emit_projectos_event(
             prep_conn,
             ctx=event_ctx,
@@ -640,6 +648,8 @@ def _orchestrate_release_capability_impl(
             project_id,
             release_human_id=release_human_id,
             version=version,
+            candidate_git_sha=approved_candidate,
+            run_id=event_ctx.run_id,
             sponsor_user_id=None,
             event_context=event_ctx,
         )
@@ -668,6 +678,8 @@ def _orchestrate_release_capability_impl(
                             project_id,
                             release_human_id=release_human_id,
                             version=version,
+                            candidate_git_sha=approved_candidate,
+                            run_id=event_ctx.run_id,
                             sponsor_user_id=None,
                             event_context=event_ctx,
                         )
@@ -730,6 +742,7 @@ def _orchestrate_release_capability_impl(
     release_record_id = str(prepared["release_record_id"])
     try:
         svc.package_release(release_record_id, event_context=event_ctx)
+        svc.verify_release(release_record_id)
     except OrchestrationError as exc:
         failure = orchestration_blocker_from_message(str(exc), repo_root=repo_root)
         with connection(ctx.db_path) as block_conn:
@@ -753,7 +766,13 @@ def _orchestrate_release_capability_impl(
     stub_installer = adapter_id == "python_desktop"
     with connection(ctx.db_path) as lookup_conn:
         artifacts = list_delivery_artifacts(lookup_conn, release_record_id)
-    installer = next((a for a in artifacts if a["artifact_type"] == "installer"), None)
+    installer = next(
+        (a for a in artifacts if a["artifact_type"] in {"installer", "installer_placeholder"}),
+        None,
+    )
+    stub_installer = adapter_id == "python_desktop" and (
+        installer is None or str(installer.get("artifact_type")) == "installer_placeholder"
+    )
     evidence_text = _format_release_evidence(
         run_id=event_ctx.run_id or "",
         release_human_id=release_human_id,
