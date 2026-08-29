@@ -582,22 +582,86 @@ def orchestrate_release_capability(
     except OrchestrationError as exc:
         failure = orchestration_blocker_from_message(str(exc), repo_root=repo_root)
         with connection(ctx.db_path) as block_conn:
-            emit_projectos_event(
-                block_conn,
-                ctx=event_ctx,
-                event_type="RELEASE_PREPARATION_BLOCKED",
-                summary=str(exc)[:500],
-                actor_id=ACTOR_PM,
-                phase="RELEASE_PREPARATION",
-                status="BLOCKED",
-                detail_level="milestone",
-                evidence=failure,
-            )
-        from projectos.run_evidence import build_terminal_evidence
+            if failure.get("blocker_type") == "DELIVERY_CONTRACT_MISSING" and repo_root:
+                from projectos.pm_delivery_remediation import attempt_delivery_contract_remediation
 
-        with connection(ctx.db_path) as conn:
-            evidence = build_terminal_evidence(conn, run_id=event_ctx.run_id or "")
-        return _format_terminal_run_evidence(evidence)
+                remediation = attempt_delivery_contract_remediation(
+                    block_conn,
+                    event_ctx=event_ctx,
+                    repo_root=repo_root,
+                    failure=failure,
+                )
+                block_conn.commit()
+                if remediation.sponsor_pause:
+                    return (
+                        f"*ProjectOS PM — WAITING FOR SPONSOR*\n"
+                        f"Run: `{event_ctx.run_id}`\n"
+                        f"{remediation.message}"
+                    )
+                if remediation.recovered:
+                    try:
+                        prepared = svc.prepare_release(
+                            project_id,
+                            release_human_id=release_human_id,
+                            version=version,
+                            sponsor_user_id=None,
+                            event_context=event_ctx,
+                        )
+                    except OrchestrationError as retry_exc:
+                        retry_failure = orchestration_blocker_from_message(
+                            str(retry_exc), repo_root=repo_root
+                        )
+                        with connection(ctx.db_path) as retry_conn:
+                            emit_projectos_event(
+                                retry_conn,
+                                ctx=event_ctx,
+                                event_type="RELEASE_PREPARATION_BLOCKED",
+                                summary=str(retry_exc)[:500],
+                                actor_id=ACTOR_PM,
+                                phase="RELEASE_PREPARATION",
+                                status="BLOCKED",
+                                detail_level="milestone",
+                                evidence=retry_failure,
+                            )
+                        return (
+                            f"*ProjectOS PM — RELEASE PREPARATION BLOCKED*\n"
+                            f"Run: `{event_ctx.run_id}`\n"
+                            "PM is managing remediation; run remains active."
+                        )
+                else:
+                    emit_projectos_event(
+                        block_conn,
+                        ctx=event_ctx,
+                        event_type="RELEASE_PREPARATION_BLOCKED",
+                        summary=str(exc)[:500],
+                        actor_id=ACTOR_PM,
+                        phase="RELEASE_PREPARATION",
+                        status="BLOCKED",
+                        detail_level="milestone",
+                        evidence=failure,
+                    )
+                    return (
+                        f"*ProjectOS PM — RELEASE PREPARATION BLOCKED*\n"
+                        f"Run: `{event_ctx.run_id}`\n"
+                        "PM is managing remediation; run remains active."
+                    )
+            else:
+                emit_projectos_event(
+                    block_conn,
+                    ctx=event_ctx,
+                    event_type="RELEASE_PREPARATION_BLOCKED",
+                    summary=str(exc)[:500],
+                    actor_id=ACTOR_PM,
+                    phase="RELEASE_PREPARATION",
+                    status="BLOCKED",
+                    detail_level="milestone",
+                    evidence=failure,
+                )
+        return (
+            f"*ProjectOS PM — RELEASE PREPARATION BLOCKED*\n"
+            f"Run: `{event_ctx.run_id}`\n"
+            "PM is managing remediation; run remains active."
+        )
 
     release_record_id = str(prepared["release_record_id"])
     try:
@@ -616,11 +680,11 @@ def orchestrate_release_capability(
                 detail_level="milestone",
                 evidence=failure,
             )
-        from projectos.run_evidence import build_terminal_evidence
-
-        with connection(ctx.db_path) as conn:
-            evidence = build_terminal_evidence(conn, run_id=event_ctx.run_id or "")
-        return _format_terminal_run_evidence(evidence)
+        return (
+            f"*ProjectOS PM — PACKAGE FAILED*\n"
+            f"Run: `{event_ctx.run_id}`\n"
+            "PM is managing remediation; run remains active."
+        )
 
     stub_installer = adapter_id == "python_desktop"
     with connection(ctx.db_path) as lookup_conn:
