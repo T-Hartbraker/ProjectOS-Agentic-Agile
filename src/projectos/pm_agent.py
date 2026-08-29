@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from projectos.domain_events import (
+    ACTOR_DEVELOPER,
     ACTOR_PM,
     EventContext,
     emit_projectos_event,
@@ -30,6 +31,7 @@ from projectos.request_capability import CapabilityContract, classify_request
 from projectos.services.context import ServiceContext
 from projectos.slack_activity_blocks import handoff_accepted_blocks
 from projectos.slack_advisor_handoff import HandoffRequest
+from projectos.sponsor_directive import classify_sponsor_ingress, directive_requires_replan
 from projectos.sponsor_handoff import (
     create_sponsor_handoff,
     get_latest_thread_handoff,
@@ -100,6 +102,140 @@ def _request_type_for_handoff(handoff: HandoffRequest) -> str:
     return cap.request_type
 
 
+def _apply_active_run_directive(
+    ctx: ServiceContext,
+    conn,
+    *,
+    handoff: HandoffRequest,
+    project_id: str,
+    team_id: str,
+    channel_id: str,
+    thread_ts: str,
+    sponsor_user_id: str,
+    advisor_text: str,
+    existing_handoff,
+    active_run,
+    request_type: str,
+) -> PmHandoffResult:
+    """Route a Sponsor follow-up into the existing active run."""
+    from projectos.run_outcomes import STATUS_WAITING_FOR_SPONSOR, normalize_waiting_status
+
+    run_id = active_run.run_id
+    handoff_id = existing_handoff.handoff_id
+    thread = event_context_from_thread(
+        project_id=project_id,
+        handoff_id=handoff_id,
+        run_id=run_id,
+        team_id=team_id,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+    )
+    if normalize_waiting_status(active_run.status) == STATUS_WAITING_FOR_SPONSOR:
+        update_execution_run(conn, run_id=run_id, status="RUNNING")
+
+    directive_evidence = {
+        "directive_kind": "ACTIVE_RUN_DIRECTIVE",
+        "objective": handoff.objective,
+        "request_type": request_type,
+        "sponsor_user_id": sponsor_user_id,
+    }
+    emit_projectos_event(
+        conn,
+        ctx=thread,
+        event_type="SPONSOR_DIRECTIVE_RECEIVED",
+        summary=handoff.objective[:500],
+        actor_id=ACTOR_PM,
+        detail_level="milestone",
+        evidence=directive_evidence,
+    )
+    emit_projectos_event(
+        conn,
+        ctx=thread,
+        event_type="PLAN_UPDATED",
+        summary="PM updated the active run plan from Sponsor directive.",
+        actor_id=ACTOR_PM,
+        detail_level="normal",
+        evidence=directive_evidence,
+    )
+    if directive_requires_replan(handoff, request_type=request_type):
+        emit_projectos_event(
+            conn,
+            ctx=thread,
+            event_type="PM_REPLAN",
+            summary="PM replanned work in response to Sponsor directive.",
+            actor_id=ACTOR_PM,
+            phase="PLANNING",
+            detail_level="normal",
+            evidence=directive_evidence,
+        )
+        agent_id = ACTOR_DEVELOPER if request_type in {"DEFECT", "WORK"} else ACTOR_PM
+        emit_projectos_event(
+            conn,
+            ctx=thread,
+            event_type="AGENT_ASSIGNED",
+            summary=f"Assigned: {agent_id} for Sponsor directive.",
+            actor_id=ACTOR_PM,
+            phase="PLANNING",
+            metadata={"agent_id": agent_id},
+            evidence=directive_evidence,
+        )
+
+    projectos_text = (
+        f"*ProjectOS PM — SPONSOR DIRECTIVE RECEIVED*\n"
+        f"Run: `{run_id}`\n"
+        f"Project: `{project_id}`\n"
+        f"Directive: {handoff.objective[:200]}"
+    )
+    advisor_note = (
+        f"{advisor_text.strip()}\n\n"
+        "Your follow-up was routed into the active run. "
+        "The PM Agent will adjust the plan and continue execution."
+    ).strip()
+    blocks = handoff_accepted_blocks(
+        handoff_id=handoff_id,
+        project_id=project_id,
+        request_type=request_type,
+        run_id=run_id,
+        objective=handoff.objective,
+    )
+
+    if request_type == "RELEASE":
+        conn.commit()
+        try:
+            evidence = orchestrate_release_capability(
+                ctx,
+                event_ctx=thread,
+                project_id=project_id,
+                handoff=handoff,
+            )
+        except OrchestrationError as exc:
+            _ensure_release_run_closed(
+                ctx,
+                event_ctx=thread,
+                project_id=project_id,
+                error=exc,
+            )
+            raise
+        return PmHandoffResult(
+            handoff_id=handoff_id,
+            run_id=run_id,
+            request_type=request_type,
+            advisor_note=advisor_note,
+            projectos_text=projectos_text,
+            projectos_blocks=blocks,
+            execution_evidence=evidence,
+        )
+
+    return PmHandoffResult(
+        handoff_id=handoff_id,
+        run_id=run_id,
+        request_type=request_type,
+        advisor_note=advisor_note,
+        projectos_text=projectos_text,
+        projectos_blocks=blocks,
+    )
+
+
 def accept_sponsor_handoff(
     ctx: ServiceContext,
     conn,
@@ -115,14 +251,37 @@ def accept_sponsor_handoff(
     existing = get_latest_thread_handoff(
         conn, team_id=team_id, channel_id=channel_id, thread_ts=thread_ts
     )
-    if existing and existing.status == "ACCEPTED_BY_PM" and existing.run_id:
-        run = get_execution_run(conn, existing.run_id)
-        if run and run.status not in {"COMPLETED", "FAILED", "CANCELLED"}:
-            raise OrchestrationError(
-                f"An active run `{existing.run_id}` already exists for this thread."
-            )
-
     request_type = _request_type_for_handoff(handoff)
+    active_run = None
+    if existing and existing.status == "ACCEPTED_BY_PM" and existing.run_id:
+        active_run = get_execution_run(conn, existing.run_id)
+
+    if (
+        active_run
+        and active_run.status not in {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED", "ESCALATED"}
+        and classify_sponsor_ingress(
+            handoff=handoff,
+            existing_handoff=existing,
+            active_run=active_run,
+            request_type=request_type,
+        )
+        == "ACTIVE_RUN_DIRECTIVE"
+    ):
+        return _apply_active_run_directive(
+            ctx,
+            conn,
+            handoff=handoff,
+            project_id=project_id,
+            team_id=team_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            sponsor_user_id=sponsor_user_id,
+            advisor_text=advisor_text,
+            existing_handoff=existing,
+            active_run=active_run,
+            request_type=request_type,
+        )
+
     record = create_sponsor_handoff(
         conn,
         project_id=project_id,
