@@ -22,9 +22,11 @@ from projectos.store import (
     list_expired_lease_job_ids,
     mark_blocked,
     mark_ready_from_blocked,
+    parse_iso,
     promote_retry_wait_to_ready,
     recover_expired_leases,
     set_job_assignment,
+    utc_now,
 )
 from projectos.validation import validate_registry_entry
 from projectos.worktree import common_git_dir, list_worktrees
@@ -818,11 +820,16 @@ def run_recovery(
                 report.blocked.append(blocked.human_id)
 
         if promote_retry_wait:
+            moment = utc_now()
             for job in list_jobs_by_statuses(conn, {"RETRY_WAIT"}):
                 if project_human_id and job.project_human_id != project_human_id:
                     continue
                 if job.project_human_id in identity_bad:
                     continue
+                if job.retry_at:
+                    retry_moment = parse_iso(job.retry_at)
+                    if retry_moment is not None and retry_moment > moment:
+                        continue
                 if job.project_human_id not in identity_ok_projects:
                     # Project had no successful check (e.g. empty) — re-check pair.
                     check = _check_project_identity(
@@ -837,6 +844,7 @@ def run_recovery(
                     conn,
                     job.id,
                     reason="recovery: identity OK; RETRY_WAIT promoted to READY",
+                    now=moment,
                 )
                 report.promoted_ready.append(promoted.human_id)
 

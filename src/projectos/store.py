@@ -53,6 +53,19 @@ def parse_iso(value: str | None) -> datetime | None:
     return datetime.fromisoformat(text)
 
 
+def _sync_next_actions_for_terminal_job(
+    conn: sqlite3.Connection, job: OrchestrationJob
+) -> None:
+    if job.status not in TERMINAL_STATUSES:
+        return
+    try:
+        from projectos.run_next_actions import complete_run_next_action_for_job
+
+        complete_run_next_action_for_job(conn, orchestration_job_id=job.id)
+    except Exception:
+        return
+
+
 @dataclass(frozen=True)
 class OrchestrationJob:
     id: int
@@ -88,6 +101,8 @@ class OrchestrationJob:
     superseded_by_job_id: int | None = None
     assignment_json: str | None = None
     allows_no_change: bool = False
+    run_id: str | None = None
+    retry_at: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row | dict[str, Any]) -> OrchestrationJob:
@@ -138,6 +153,8 @@ class OrchestrationJob:
             ),
             assignment_json=get("assignment_json"),
             allows_no_change=bool(get("allows_no_change") or 0),
+            run_id=get("run_id"),
+            retry_at=get("retry_at"),
         )
 
 
@@ -365,6 +382,8 @@ def create_job(
     identity_snapshot: dict[str, Any] | None = None,
     assignment: dict[str, Any] | None = None,
     allows_no_change: bool = False,
+    run_id: str | None = None,
+    retry_at: str | None = None,
 ) -> OrchestrationJob:
     if status not in JOB_STATUSES:
         raise OrchestrationError(f"Invalid job status {status!r}")
@@ -389,8 +408,9 @@ def create_job(
             work_item_type, work_item_human_id, agent_role, queue, status,
             priority, attempt, max_attempts, worktree_name, worktree_path,
             base_git_sha, requires_worktree, identity_snapshot_json,
-            created_at, ready_at, updated_at, assignment_json, allows_no_change
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, ready_at, updated_at, assignment_json, allows_no_change,
+            run_id, retry_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             human_id,
@@ -415,6 +435,8 @@ def create_job(
             now,
             assignment_json,
             1 if allows_no_change else 0,
+            run_id,
+            retry_at,
         ),
     )
     return _row_to_job(conn, int(cur.lastrowid))
@@ -642,18 +664,32 @@ def promote_retry_wait_to_ready(
     job_id: int,
     *,
     reason: str = "recovery promoted RETRY_WAIT to READY",
+    now: datetime | None = None,
 ) -> OrchestrationJob:
-    now = utc_now_iso()
+    job = _row_to_job(conn, job_id)
+    if job.status != "RETRY_WAIT":
+        raise OrchestrationError(
+            f"Cannot promote job {job_id} to READY: expected RETRY_WAIT"
+        )
+    moment = now or utc_now()
+    if job.retry_at:
+        retry_moment = parse_iso(job.retry_at)
+        if retry_moment is not None and retry_moment > moment:
+            raise OrchestrationError(
+                f"Cannot promote job {job_id}: retry_at {job.retry_at} is in the future"
+            )
+    now_iso = moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     cur = conn.execute(
         """
         UPDATE orchestration_jobs
         SET status = 'READY',
             ready_at = ?,
             updated_at = ?,
-            last_error = NULL
+            last_error = NULL,
+            retry_at = NULL
         WHERE id = ? AND status = 'RETRY_WAIT'
         """,
-        (now, now, job_id),
+        (now_iso, now_iso, job_id),
     )
     if cur.rowcount != 1:
         raise OrchestrationError(
@@ -798,6 +834,35 @@ def list_jobs_by_statuses(
         """,
         tuple(sorted(statuses)),
     ).fetchall()
+    return [OrchestrationJob.from_row(r) for r in rows]
+
+
+def list_jobs_for_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    statuses: frozenset[str] | set[str] | None = None,
+) -> list[OrchestrationJob]:
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM orchestration_jobs
+            WHERE run_id = ?
+              AND status IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            (run_id, *sorted(statuses)),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM orchestration_jobs
+            WHERE run_id = ?
+            ORDER BY id ASC
+            """,
+            (run_id,),
+        ).fetchall()
     return [OrchestrationJob.from_row(r) for r in rows]
 
 
@@ -1021,7 +1086,9 @@ def mark_succeeded(
         payload={"outcome": outcome} if outcome else None,
     )
     release_lease(conn, job_id, reason="succeeded")
-    return _row_to_job(conn, job_id)
+    updated = _row_to_job(conn, job_id)
+    _sync_next_actions_for_terminal_job(conn, updated)
+    return updated
 
 
 def mark_cancelled(
@@ -1114,6 +1181,12 @@ def mark_failure(
     else:
         status = "RETRY_WAIT"
 
+    retry_at = None
+    if status == "RETRY_WAIT":
+        retry_at = (utc_now() + timedelta(seconds=min(30 * attempt, 300))).replace(
+            microsecond=0
+        ).isoformat().replace("+00:00", "Z")
+
     conn.execute(
         """
         UPDATE orchestration_jobs
@@ -1122,10 +1195,11 @@ def mark_failure(
             last_error = ?,
             output_ref = COALESCE(?, output_ref),
             completed_at = CASE WHEN ? IN ('FAILED', 'BLOCKED') THEN ? ELSE completed_at END,
-            updated_at = ?
+            updated_at = ?,
+            retry_at = ?
         WHERE id = ?
         """,
-        (status, attempt, error, output_ref, status, now, now, job_id),
+        (status, attempt, error, output_ref, status, now, now, retry_at, job_id),
     )
     append_run_event(
         conn,
@@ -1136,7 +1210,9 @@ def mark_failure(
         payload={"attempt": attempt, "max_attempts": job.max_attempts},
     )
     release_lease(conn, job_id, reason=f"failure:{status}")
-    return _row_to_job(conn, job_id)
+    updated = _row_to_job(conn, job_id)
+    _sync_next_actions_for_terminal_job(conn, updated)
+    return updated
 
 
 def insert_agent_run(
@@ -1383,6 +1459,9 @@ def insert_qa_evidence(
     candidate_git_sha: str,
     assurance_role: str,
     result: str = "pending",
+    run_id: str | None = None,
+    attempt_number: int | None = None,
+    prior_assurance_job_id: int | None = None,
 ) -> int:
     pid = require_same_project(
         conn, delivery_job_id, assurance_job_id, action="insert_qa_evidence"
@@ -1402,8 +1481,9 @@ def insert_qa_evidence(
         """
         INSERT INTO qa_evidence (
             project_human_id, repository_root, delivery_job_id,
-            assurance_job_id, candidate_git_sha, assurance_role, result
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            assurance_job_id, candidate_git_sha, assurance_role, result,
+            run_id, remediation_cycle
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             project_human_id,
@@ -1413,9 +1493,25 @@ def insert_qa_evidence(
             candidate_git_sha,
             assurance_role,
             result,
+            run_id,
+            int(attempt_number or 0),
         ),
     )
-    return int(cur.lastrowid)
+    evidence_id = int(cur.lastrowid)
+    if prior_assurance_job_id is not None:
+        append_run_event(
+            conn,
+            assurance_job_id,
+            "qa.retry_attempt",
+            status="READY",
+            message=f"Assurance retry attempt {attempt_number or 1}",
+            payload={
+                "prior_assurance_job_id": prior_assurance_job_id,
+                "attempt_number": attempt_number,
+                "run_id": run_id,
+            },
+        )
+    return evidence_id
 
 
 def insert_candidate_invalidation(
