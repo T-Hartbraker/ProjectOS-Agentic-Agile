@@ -6,7 +6,7 @@ import sqlite3
 
 from projectos.errors import OrchestrationError
 
-TERMINAL_QA_RESULTS = frozenset({"pass", "fail", "stale_rejected"})
+TERMINAL_QA_RESULTS = frozenset({"pass", "fail", "stale_rejected", "inconclusive"})
 
 
 class QAEvidenceImmutableError(OrchestrationError):

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from projectos.constants import ASSURANCE_QUEUES
 from projectos.errors import OrchestrationError
 from projectos.projectctl_bridge import show_work_item
 from projectos.store import OrchestrationJob
@@ -30,19 +31,19 @@ ROLE_INSTRUCTIONS: dict[str, str] = {
     "ASSURANCE_FUNCTIONAL": (
         "You are Functional Assurance. Validate the candidate revision against "
         "acceptance criteria. Independent QA only — do not modify delivery code "
-        "to make tests pass silently."
+        "to make tests pass silently. Worker execution success is not a QA PASS."
     ),
     "ASSURANCE_INTEGRATION": (
         "You are Integration Assurance. Validate integration behavior for the "
-        "candidate revision. Independent QA only."
+        "candidate revision. Independent QA only. Worker execution success is not a QA PASS."
     ),
     "ASSURANCE_SECURITY": (
         "You are Security Assurance. Review the candidate revision for security "
-        "issues. Independent QA only."
+        "issues. Independent QA only. Worker execution success is not a QA PASS."
     ),
     "ASSURANCE_QUALITY": (
         "You are Quality Assurance. Assess overall quality for the candidate "
-        "revision. Independent QA only."
+        "revision. Independent QA only. Worker execution success is not a QA PASS."
     ),
     "RELEASE": (
         "You are the Release agent. Evaluate release readiness using governed "
@@ -259,6 +260,10 @@ def build_role_prompt(
                 "- Worker SUCCEEDED is not release approval.",
             ]
         )
+    if job.queue in ASSURANCE_QUEUES:
+        from projectos.assurance_verdict import assurance_output_contract
+
+        lines.extend(["", assurance_output_contract(job)])
     if extra_context:
         lines.extend(["", "## Additional context", extra_context.strip()])
     lines.extend(
