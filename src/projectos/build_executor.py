@@ -100,7 +100,12 @@ class GitHubActionsBuildExecutor:
         )
 
 
-def select_build_executor(*, prefer_ci: bool, ci_available: bool) -> BuildExecutor:
-    if prefer_ci and ci_available:
-        return GitHubActionsBuildExecutor()
+def select_build_executor(
+    *,
+    prefer_ci: bool,
+    ci_available: bool,
+    trigger_workflow: Callable[..., dict[str, Any]] | None = None,
+) -> BuildExecutor:
+    if prefer_ci and ci_available and trigger_workflow is not None:
+        return GitHubActionsBuildExecutor(trigger_workflow=trigger_workflow)
     return LocalBuildExecutor()
