@@ -369,17 +369,26 @@ def orchestrate_release_capability(
             adapter_id = "unknown"
 
     with connection(ctx.db_path) as qa_conn:
-        from projectos.qa_gate import emit_qa_gate_evaluation
+        from projectos.pm_remediation import run_qa_with_remediation
 
-        facts = emit_qa_gate_evaluation(qa_conn, project_id=project_id, event_context=event_ctx)
+        qa_result = run_qa_with_remediation(
+            qa_conn, event_ctx=event_ctx, project_id=project_id
+        )
 
-    gate = str(facts.get("gate") or "PENDING")
-    if gate != "PASSED":
+    if qa_result.escalated:
         from projectos.run_evidence import build_terminal_evidence
 
         with connection(ctx.db_path) as conn:
             evidence = build_terminal_evidence(conn, run_id=event_ctx.run_id or "")
         return _format_terminal_run_evidence(evidence)
+
+    gate = qa_result.gate
+    if gate != "PASSED":
+        return (
+            f"*ProjectOS PM — QA gate `{gate}`*\n"
+            f"Run: `{event_ctx.run_id}`\n"
+            "PM is managing remediation; run remains active."
+        )
 
     with connection(ctx.db_path) as prep_conn:
         emit_projectos_event(
