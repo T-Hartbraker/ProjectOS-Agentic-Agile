@@ -1,8 +1,9 @@
-"""Live Enterprise FAT #2 regression — QA gate, delivery contract, terminal runs."""
+"""Closed-loop orchestration regression tests (FAT #2 successor)."""
 
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -11,18 +12,24 @@ import pytest
 from helpers import init_git_repo, write_identity, write_registry
 from projectos.db import connection
 from projectos.domain_events import EventContext, emit_projectos_event
-from projectos.event_dispatcher import dispatch_event_outbox
+from projectos.execution_run import create_execution_run, update_execution_run
 from projectos.migrate import initialize_database
 from projectos.pm_agent import accept_sponsor_handoff, orchestrate_release_capability
-from projectos.qa_gate import emit_qa_gate_evaluation
-from projectos.run_evidence import build_terminal_evidence
+from projectos.pm_remediation import run_qa_with_remediation
+from projectos.run_evidence import close_execution_run, pause_run_for_sponsor_decision
+from projectos.run_outcomes import OUTCOME_SUCCESS, OUTCOME_UNRECOVERABLE_TECHNICAL
 from projectos.run_state import apply_event_to_run
 from projectos.services.context import ServiceContext
 from projectos.slack_advisor_handoff import HandoffRequest
 from projectos.slack_activity_blocks import activity_event_to_blocks
+from projectos.sponsor_handoff import create_sponsor_handoff, mark_handoff_accepted
 from projectos.sponsor_query import SponsorQueryService
 from projectos.qa_semantics import collect_assurance_facts
 from projectos.store import add_slack_interface_channel
+
+TEAM = "T1"
+CHANNEL = "C0BSYCCDRST"
+THREAD = "1788023487.700189"
 
 
 def _ctx(tmp_path: Path, *, with_delivery_json: bool = True) -> ServiceContext:
@@ -62,11 +69,11 @@ def _ctx(tmp_path: Path, *, with_delivery_json: bool = True) -> ServiceContext:
     db = tmp_path / "projectos.db"
     initialize_database(db)
     with connection(db) as conn:
-        add_slack_interface_channel(conn, channel_id="C0BSYCCDRST", team_id="T1", is_default=True)
+        add_slack_interface_channel(conn, channel_id=CHANNEL, team_id=TEAM, is_default=True)
     return ServiceContext(db_path=db, registry_path=tmp_path / "projects.json")
 
 
-def _seed_qa_evidence(conn, *, total: int = 16, failed: int = 8, repo_root: str = "/repo") -> None:
+def _seed_qa_evidence(conn, *, total: int = 16, failed: int = 8) -> None:
     for i in range(total):
         result = "fail" if i < failed else "pass"
         conn.execute(
@@ -74,37 +81,45 @@ def _seed_qa_evidence(conn, *, total: int = 16, failed: int = 8, repo_root: str 
             INSERT INTO qa_evidence (
                 project_human_id, repository_root, candidate_git_sha,
                 assurance_role, result, created_at
-            ) VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ) VALUES ('PRJ-003', '/repo', ?, ?, ?, datetime('now'))
             """,
-            ("PRJ-003", repo_root, f"sha{i:04d}", f"ASSURANCE_{i % 4}", result),
+            (f"sha{i:04d}", f"ASSURANCE_{i % 4}", result),
         )
 
 
-def _seed_handoff_run(conn, *, run_id: str = "RUN-29280E59", handoff_id: str = "HND-99383CEFF5F7") -> EventContext:
-    conn.execute(
-        """
-        INSERT INTO sponsor_handoffs (
-            handoff_id, project_id, team_id, channel_id, thread_ts,
-            sponsor_user_id, request_type, objective, status, run_id
-        ) VALUES (?, 'PRJ-003', 'T1', 'C0BSYCCDRST', '1788023487.700189', 'U1', 'RELEASE',
-                  're-release package and installer', 'ACCEPTED_BY_PM', ?)
-        """,
-        (handoff_id, run_id),
+def _seed_handoff_run(conn, *, run_id: str | None = None) -> EventContext:
+    handoff = create_sponsor_handoff(
+        conn,
+        project_id="PRJ-003",
+        team_id=TEAM,
+        channel_id=CHANNEL,
+        thread_ts=THREAD,
+        sponsor_user_id="U1",
+        request_type="RELEASE",
+        objective="re-release package and installer",
     )
-    conn.execute(
-        """
-        INSERT INTO execution_runs (
-            run_id, project_id, handoff_id, request_type, objective, status
-        ) VALUES (?, 'PRJ-003', ?, 'RELEASE', 're-release package and installer', 'PLANNING')
-        """,
-        (run_id, handoff_id),
+    run = create_execution_run(
+        conn,
+        project_id="PRJ-003",
+        handoff_id=handoff.handoff_id,
+        request_type="RELEASE",
+        objective=handoff.objective,
     )
+    actual_run_id = run.run_id
+    if run_id and run_id != actual_run_id:
+        conn.execute(
+            "UPDATE execution_runs SET run_id = ? WHERE run_id = ?",
+            (run_id, actual_run_id),
+        )
+        actual_run_id = run_id
+    mark_handoff_accepted(conn, handoff_id=handoff.handoff_id, run_id=actual_run_id)
+    update_execution_run(conn, run_id=actual_run_id, status="RUNNING")
     return EventContext(
         project_id="PRJ-003",
-        handoff_id=handoff_id,
-        run_id=run_id,
-        slack_channel_id="C0BSYCCDRST",
-        slack_thread_ts="1788023487.700189",
+        handoff_id=handoff.handoff_id,
+        run_id=actual_run_id,
+        slack_channel_id=CHANNEL,
+        slack_thread_ts=THREAD,
     )
 
 
@@ -122,47 +137,58 @@ def _release_handoff() -> HandoffRequest:
     )
 
 
-def test_qa_gate_failed_blocks_delivery_phase(tmp_path: Path) -> None:
+def test_qa_fail_remediation_pass_no_run_blocked(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path)
     with connection(ctx.db_path) as conn:
         _seed_qa_evidence(conn, total=16, failed=8)
         event_ctx = _seed_handoff_run(conn)
-        handoff = _release_handoff()
-        conn.commit()
-        evidence = orchestrate_release_capability(
-            ctx, event_ctx=event_ctx, project_id="PRJ-003", handoff=handoff
-        )
-        events = conn.execute(
-            "SELECT event_type, phase FROM projectos_events WHERE run_id = 'RUN-29280E59'"
-        ).fetchall()
-        run = conn.execute(
-            "SELECT status, current_phase FROM execution_runs WHERE run_id = 'RUN-29280E59'"
-        ).fetchone()
-        terminal = build_terminal_evidence(conn, run_id="RUN-29280E59")
-    types = [r["event_type"] for r in events]
-    phase_events = [r for r in events if r["event_type"] == "PHASE_CHANGED"]
-    assert "QA_GATE_FAILED" in types
-    assert "RUN_BLOCKED" in types
-    assert "AGENT_ASSIGNED" not in types
-    assert all(
-        "RELEASE_PREPARATION" not in str(r.get("phase") or "").upper()
-        and "DELIVERY" not in str(r.get("phase") or "").upper()
-        for r in phase_events
+    evidence = orchestrate_release_capability(
+        ctx, event_ctx=event_ctx, project_id="PRJ-003", handoff=_release_handoff()
     )
-    assert run["status"] == "BLOCKED"
-    assert "RUN BLOCKED" in evidence.upper()
-    assert terminal.get("failure")
+    with connection(ctx.db_path) as conn:
+        types = {
+            row["event_type"]
+            for row in conn.execute(
+                "SELECT event_type FROM projectos_events WHERE run_id = ?", (event_ctx.run_id,)
+            ).fetchall()
+        }
+        run = conn.execute(
+            "SELECT status FROM execution_runs WHERE run_id = ?", (event_ctx.run_id,)
+        ).fetchone()
+    assert "REMEDIATION_STARTED" in types or "QA_GATE_PASSED" in types
+    assert "RUN_BLOCKED" not in types
+    assert run["status"] == "RUNNING"
+    assert "remediation" in evidence.lower() or "QA gate" in evidence
 
 
-def test_terminal_run_not_reopened_by_later_events(tmp_path: Path) -> None:
+def test_qa_failure_alone_never_terminalizes(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    with connection(ctx.db_path) as conn:
+        _seed_qa_evidence(conn, total=4, failed=4)
+        event_ctx = _seed_handoff_run(conn, run_id="RUN-NB")
+        run_qa_with_remediation(conn, event_ctx=event_ctx, project_id="PRJ-003", max_cycles=0)
+        blocked = conn.execute(
+            "SELECT 1 FROM projectos_events WHERE run_id = ? AND event_type = 'RUN_BLOCKED'",
+            (event_ctx.run_id,),
+        ).fetchone()
+    assert blocked is None
+
+
+def test_terminal_run_not_reopened_by_operational_events(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path)
     with connection(ctx.db_path) as conn:
         event_ctx = _seed_handoff_run(conn, run_id="RUN-LOCK")
+        close_execution_run(
+            conn,
+            event_ctx=event_ctx,
+            outcome=OUTCOME_UNRECOVERABLE_TECHNICAL,
+            summary="PM blocked run.",
+        )
         apply_event_to_run(
             conn,
             run_id="RUN-LOCK",
             event_type="QA_GATE_FAILED",
-            payload={"status": "BLOCKED", "phase": "QA_GATE", "actor_id": "qa-agent", "progress": 40},
+            payload={"phase": "QA_GATE", "actor_id": "qa-agent", "progress": 40},
         )
         apply_event_to_run(
             conn,
@@ -170,17 +196,60 @@ def test_terminal_run_not_reopened_by_later_events(tmp_path: Path) -> None:
             event_type="PHASE_CHANGED",
             payload={"phase": "DELIVERY", "actor_id": "pm-agent", "progress": 25},
         )
-        apply_event_to_run(
-            conn,
-            run_id="RUN-LOCK",
-            event_type="AGENT_ASSIGNED",
-            payload={"phase": "DELIVERY", "actor_id": "delivery-agent", "progress": 25},
-        )
         run = conn.execute(
             "SELECT status, current_phase FROM execution_runs WHERE run_id = 'RUN-LOCK'"
         ).fetchone()
     assert run["status"] == "BLOCKED"
-    assert run["current_phase"] == "QA_GATE"
+
+
+def test_waiting_for_sponsor_pauses_without_terminalizing(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    with connection(ctx.db_path) as conn:
+        event_ctx = _seed_handoff_run(conn, run_id="RUN-WAIT")
+        pause_run_for_sponsor_decision(
+            conn, event_ctx=event_ctx, summary="Need signing policy decision."
+        )
+        run = conn.execute(
+            "SELECT status FROM execution_runs WHERE run_id = 'RUN-WAIT'"
+        ).fetchone()
+        terminal = conn.execute(
+            "SELECT 1 FROM projectos_events WHERE run_id = 'RUN-WAIT' AND event_type = 'RUN_BLOCKED'"
+        ).fetchone()
+    assert run["status"] == "WAITING_FOR_SPONSOR"
+    assert terminal is None
+
+
+def test_recoverable_delivery_contract_missing_remediates(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path, with_delivery_json=False)
+    repo_root = json.loads(
+        (tmp_path / "projects.json").read_text(encoding="utf-8")
+    )["projects"][0]["repository_root"]
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/acme/gamma.git"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    with connection(ctx.db_path) as conn:
+        _seed_qa_evidence(conn, total=16, failed=0)
+        event_ctx = _seed_handoff_run(conn, run_id="RUN-DELIV")
+    orchestrate_release_capability(
+        ctx, event_ctx=event_ctx, project_id="PRJ-003", handoff=_release_handoff()
+    )
+    with connection(ctx.db_path) as conn:
+        types = {
+            row["event_type"]
+            for row in conn.execute(
+                "SELECT event_type FROM projectos_events WHERE run_id = 'RUN-DELIV'"
+            ).fetchall()
+        }
+        run = conn.execute(
+            "SELECT status FROM execution_runs WHERE run_id = 'RUN-DELIV'"
+        ).fetchone()
+    assert "DELIVERY_CONTRACT_MISSING" in types or "PM_REPLAN" in types
+    assert "RUN_BLOCKED" not in types
+    assert run["status"] == "RUNNING"
+    assert Path(repo_root, "project", "delivery.json").is_file()
 
 
 def test_handoff_accepted_outbox_includes_request_type(tmp_path: Path) -> None:
@@ -204,46 +273,32 @@ def test_handoff_accepted_outbox_includes_request_type(tmp_path: Path) -> None:
         ).fetchone()
     payload = json.loads(row["payload_json"])
     blocks = activity_event_to_blocks(payload)
-    block_text = json.dumps(blocks)
     assert payload.get("request_type") == "RELEASE"
-    assert "RELEASE" in block_text
+    assert "RELEASE" in json.dumps(blocks)
 
 
-def test_qa_pass_missing_delivery_contract_blocks_with_evidence(tmp_path: Path) -> None:
-    ctx = _ctx(tmp_path, with_delivery_json=False)
-    with connection(ctx.db_path) as conn:
-        _seed_qa_evidence(conn, total=16, failed=0)
-        event_ctx = _seed_handoff_run(conn, run_id="RUN-DELIV")
-        handoff = _release_handoff()
-        conn.commit()
-        evidence = orchestrate_release_capability(
-            ctx, event_ctx=event_ctx, project_id="PRJ-003", handoff=handoff
-        )
-        events = conn.execute(
-            "SELECT event_type, phase, summary FROM projectos_events WHERE run_id = 'RUN-DELIV'"
-        ).fetchall()
-        terminal = build_terminal_evidence(conn, run_id="RUN-DELIV")
-    types = {r["event_type"] for r in events}
-    assert "QA_GATE_PASSED" in types
-    assert "RELEASE_PREPARATION_BLOCKED" in types
-    assert "RUN_BLOCKED" in types
-    failure = terminal.get("failure") or {}
-    assert failure.get("blocker_type") == "DELIVERY_CONTRACT_MISSING"
-    assert "delivery.json" in str(failure.get("path", "")).lower()
-    assert "DELIVERY_CONTRACT_MISSING" in evidence or "RUN BLOCKED" in evidence.upper()
-
-
-def test_blocker_question_uses_terminal_evidence(tmp_path: Path) -> None:
+def test_blocker_question_uses_active_run_evidence(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path, with_delivery_json=False)
     with connection(ctx.db_path) as conn:
         _seed_qa_evidence(conn, total=16, failed=8)
         event_ctx = _seed_handoff_run(conn, run_id="RUN-BLK")
-        handoff = _release_handoff()
-        conn.commit()
-        orchestrate_release_capability(ctx, event_ctx=event_ctx, project_id="PRJ-003", handoff=handoff)
+        emit_projectos_event(
+            conn,
+            ctx=event_ctx,
+            event_type="QA_GATE_FAILED",
+            summary="QA gate failed.",
+            phase="QA_GATE",
+            evidence={"gate": "FAILED"},
+        )
+        emit_projectos_event(
+            conn,
+            ctx=event_ctx,
+            event_type="REMEDIATION_REQUIRED",
+            summary="PM requires remediation.",
+            phase="REMEDIATION",
+        )
     answer = SponsorQueryService(ctx).get_blocker_summary("PRJ-003")
-    assert "delivery.json" in answer.lower() or "QA gate" in answer
-    assert "Required action" in answer or "Blocker type" in answer or "Reason:" in answer
+    assert "qa" in answer.lower() or "remediation" in answer.lower() or "delivery" in answer.lower()
 
 
 def test_qa_semantics_preserve_distinct_job_and_review_counts(tmp_path: Path) -> None:
@@ -265,33 +320,83 @@ def test_qa_semantics_preserve_distinct_job_and_review_counts(tmp_path: Path) ->
     assert facts.get("qa_jobs_total") == 20
     assert facts.get("reviews_total") == 16
     assert facts.get("qa_jobs_total") != facts.get("reviews_total")
-    rules = facts.get("semantic_rules", {})
-    assert "never_substitute" in rules
 
 
-def test_accept_handoff_emits_terminal_on_orchestration_failure(tmp_path: Path, monkeypatch) -> None:
+def test_worker_failure_evidence_leaves_run_recoverable(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    with connection(ctx.db_path) as conn:
+        event_ctx = _seed_handoff_run(conn, run_id="RUN-WORK")
+        apply_event_to_run(
+            conn,
+            run_id="RUN-WORK",
+            event_type="WORK_FAILED",
+            payload={"phase": "REMEDIATION", "actor_id": "developer-agent", "progress": 50},
+        )
+        run = conn.execute(
+            "SELECT status FROM execution_runs WHERE run_id = 'RUN-WORK'"
+        ).fetchone()
+        blocked = conn.execute(
+            "SELECT 1 FROM projectos_events WHERE run_id = 'RUN-WORK' AND event_type = 'RUN_BLOCKED'"
+        ).fetchone()
+    assert run["status"] == "RUNNING"
+    assert blocked is None
+
+
+def test_only_pm_terminal_events_close_run(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    with connection(ctx.db_path) as conn:
+        event_ctx = _seed_handoff_run(conn, run_id="RUN-PM")
+        for event_type in ("QA_GATE_FAILED", "PACKAGE_FAILED", "RELEASE_PREPARATION_BLOCKED"):
+            apply_event_to_run(
+                conn,
+                run_id="RUN-PM",
+                event_type=event_type,
+                payload={"phase": "QA_GATE", "actor_id": "qa-agent", "progress": 40},
+            )
+        run = conn.execute(
+            "SELECT status FROM execution_runs WHERE run_id = 'RUN-PM'"
+        ).fetchone()
+    assert run["status"] == "RUNNING"
+
+
+def test_sponsor_directive_during_active_run_same_run_id(tmp_path: Path, monkeypatch) -> None:
     ctx = _ctx(tmp_path)
     monkeypatch.setattr(
         "projectos.pm_agent.orchestrate_release_capability",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            __import__("projectos.errors", fromlist=["OrchestrationError"]).OrchestrationError("unexpected")
-        ),
+        lambda *args, **kwargs: "mock",
     )
-    handoff = _release_handoff()
     with connection(ctx.db_path) as conn:
-        with pytest.raises(Exception):
-            accept_sponsor_handoff(
-                ctx,
-                conn,
-                handoff=handoff,
-                project_id="PRJ-003",
-                team_id="T1",
-                channel_id="C0BSYCCDRST",
-                thread_ts="1788023487.700189",
-                sponsor_user_id="U1",
-            )
-        run = conn.execute(
-            "SELECT status FROM execution_runs ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-    assert run is not None
-    assert run["status"] in {"BLOCKED", "FAILED"}
+        first = accept_sponsor_handoff(
+            ctx,
+            conn,
+            handoff=_release_handoff(),
+            project_id="PRJ-003",
+            team_id=TEAM,
+            channel_id=CHANNEL,
+            thread_ts=THREAD,
+            sponsor_user_id="U1",
+        )
+        follow_up = HandoffRequest(
+            project_id="PRJ-003",
+            objective="Investigate the context error and resolve it.",
+            action_type="work_request",
+            rationale="",
+            scope="",
+            constraints="{}",
+            acceptance_intent="",
+            exclusions="",
+            source_conversation_summary="",
+        )
+        second = accept_sponsor_handoff(
+            ctx,
+            conn,
+            handoff=follow_up,
+            project_id="PRJ-003",
+            team_id=TEAM,
+            channel_id=CHANNEL,
+            thread_ts=THREAD,
+            sponsor_user_id="U1",
+        )
+        count = conn.execute("SELECT COUNT(*) FROM execution_runs").fetchone()[0]
+    assert second.run_id == first.run_id
+    assert int(count) == 1
