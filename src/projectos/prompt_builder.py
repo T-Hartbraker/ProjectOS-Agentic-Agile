@@ -191,6 +191,8 @@ def build_role_prompt(
         lines.append(f"- base_git_sha: {base_git_sha or job.base_git_sha}")
     if job.candidate_git_sha:
         lines.append(f"- candidate_git_sha: {job.candidate_git_sha}")
+    if job.source_candidate_sha:
+        lines.append(f"- source_candidate_sha: {job.source_candidate_sha}")
 
     if resolved is not None:
         lines.extend(
@@ -244,6 +246,19 @@ def build_role_prompt(
             "- Do not infer feature scope from the job human_id alone.",
         ]
     )
+    if job.queue == "RELEASE":
+        lines.extend(
+            [
+                "- Evaluate release readiness for source_candidate_sha only.",
+                "- Repository HEAD is not the release candidate unless it "
+                "equals source_candidate_sha.",
+                "- Do not persist or promote a SHA that is not the integrated "
+                "candidate.",
+                "- Do not write files into the product/candidate worktree.",
+                "- Record readiness evidence only in ProjectOS run logs.",
+                "- Worker SUCCEEDED is not release approval.",
+            ]
+        )
     if extra_context:
         lines.extend(["", "## Additional context", extra_context.strip()])
     lines.extend(

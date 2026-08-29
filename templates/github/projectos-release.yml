@@ -1,0 +1,53 @@
+# Reusable ProjectOS release workflow.
+# Triggered by ProjectOS CI executor with an exact approved git SHA.
+
+name: ProjectOS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_sha:
+        description: Approved source SHA
+        required: true
+        type: string
+      version:
+        description: Semantic version (X.Y.Z)
+        required: true
+        type: string
+      release_record_id:
+        description: ProjectOS delivery release record id
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout approved SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea3d69b1d668a8bcfe0c
+        with:
+          ref: ${{ inputs.git_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ee069c9a664ed1c3a75f7151
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -e .
+
+      - name: Build and package
+        run: python -m projectos release package --record "${{ inputs.release_record_id }}"
+        env:
+          PROJECTOS_DELIVERY_EXECUTOR: CI
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@26f96dfa697d77e81fd5927bcaafecf07513fb9
+        with:
+          name: projectos-release-${{ inputs.version }}
+          path: state/delivery/builds/${{ inputs.release_record_id }}/out/**

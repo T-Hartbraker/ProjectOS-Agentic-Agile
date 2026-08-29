@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import os
+import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -193,3 +195,95 @@ def load_registry(
         projects=tuple(entries),
         path=registry_path.resolve(),
     )
+
+
+def empty_registry(path: Path | str) -> ProjectRegistry:
+    """In-memory empty registry used for first-time governed onboarding."""
+    return ProjectRegistry(
+        schema_version=1,
+        projects=(),
+        path=Path(path).resolve(),
+    )
+
+
+def load_registry_or_empty(
+    path: Path | str | None = None,
+    *,
+    schema_path: Path | str | None = None,
+) -> ProjectRegistry:
+    registry_path = Path(path) if path is not None else DEFAULT_REGISTRY_PATH
+    if not registry_path.is_file():
+        return empty_registry(registry_path)
+    return load_registry(registry_path, schema_path=schema_path)
+
+
+def registry_document(registry: ProjectRegistry) -> dict[str, Any]:
+    return {
+        "schema_version": int(registry.schema_version),
+        "projects": [
+            {
+                "project_human_id": entry.project_human_id,
+                "repository_root": str(Path(entry.repository_root).resolve()),
+                "enabled": bool(entry.enabled),
+            }
+            for entry in registry.projects
+        ],
+    }
+
+
+def persist_registry(
+    registry: ProjectRegistry,
+    *,
+    schema_path: Path | str | None = None,
+) -> ProjectRegistry:
+    """Validate the full document, then replace projects.json atomically.
+
+    The live registry file is not truncated or rewritten in place. A failed
+    persist leaves the previous file (or absence of file) unchanged.
+    """
+    path = Path(registry.path)
+    schema = Path(schema_path) if schema_path is not None else PROJECTS_SCHEMA_PATH
+    document = registry_document(registry)
+    _validate_against_schema(document, schema)
+    rebuilt = [
+        RegistryEntry(
+            project_human_id=str(item["project_human_id"]).strip(),
+            repository_root=Path(str(item["repository_root"]).strip()),
+            enabled=bool(item["enabled"]),
+            raw=dict(item),
+        )
+        for item in document["projects"]
+    ]
+    _detect_duplicates(rebuilt)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".projects-",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    replaced = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(document, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        replaced = True
+    finally:
+        if not replaced and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+    return load_registry(path, schema_path=schema)
+
+
+def replace_entry(registry: ProjectRegistry, entry: RegistryEntry) -> ProjectRegistry:
+    projects = tuple(
+        entry if existing.project_human_id == entry.project_human_id else existing
+        for existing in registry.projects
+    )
+    if not any(p.project_human_id == entry.project_human_id for p in registry.projects):
+        projects = registry.projects + (entry,)
+    return replace(registry, projects=projects)

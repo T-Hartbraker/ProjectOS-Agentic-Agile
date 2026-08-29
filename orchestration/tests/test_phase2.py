@@ -362,8 +362,8 @@ def test_dispatch_independent_overlap_and_dependency_order(tmp_path: Path) -> No
         elif job == "B":
             time.sleep(0.05)
         elif job == "C":
-            # C must not start until A and B finished (deps).
-            assert "A" in finished and "B" in finished
+            # C is PRJ-A work and waits only on A, never on PRJ-B.
+            assert "A" in finished
         with lock:
             finished[job] = time.perf_counter()
         return FakeCompletedProcess(0, f"ok-{job}", "")
@@ -397,7 +397,6 @@ def test_dispatch_independent_overlap_and_dependency_order(tmp_path: Path) -> No
             status="READY",
         )
         add_job_dependency(conn, c.id, a.id)
-        add_job_dependency(conn, c.id, b.id)
 
     result = run_dispatch(
         until_idle=True,
@@ -412,7 +411,7 @@ def test_dispatch_independent_overlap_and_dependency_order(tmp_path: Path) -> No
     assert "A" in started and "B" in started
     # Overlap: each started before the other finished
     assert started["A"] < finished["B"] and started["B"] < finished["A"]
-    assert finished["C"] > finished["A"] and finished["C"] > finished["B"]
+    assert finished["C"] > finished["A"]
     with connection(db) as conn:
         assert get_job_by_human_id(conn, "JOB-C").status == "SUCCEEDED"
 

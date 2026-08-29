@@ -109,6 +109,7 @@ def run_dispatch(
     cursor_runner: Callable[..., Any] | None = None,
     projectctl_runner=None,
     skip_identity_validation: bool = False,
+    project_human_id: str | None = None,
     idle_poll_seconds: float = 0.05,
     max_waves: int | None = None,
     cancel_event: threading.Event | None = None,
@@ -151,7 +152,11 @@ def run_dispatch(
                 slots = max_parallel - len(in_flight)
                 selected = []
                 if slots > 0 and not local_cancel.is_set():
-                    for job in list_eligible_ready_jobs(conn, limit=slots + len(busy)):
+                    for job in list_eligible_ready_jobs(
+                        conn,
+                        limit=slots + len(busy),
+                        project_human_id=project_human_id,
+                    ):
                         if job.human_id in busy:
                             continue
                         selected.append(job)
@@ -217,7 +222,11 @@ def run_dispatch(
                 if not in_flight:
                     time.sleep(idle_poll_seconds)
                     with connection(path) as conn:
-                        if not list_eligible_ready_jobs(conn, limit=1):
+                        if not list_eligible_ready_jobs(
+                            conn,
+                            limit=1,
+                            project_human_id=project_human_id,
+                        ):
                             stop = True
     except KeyboardInterrupt:
         _request_cancel()

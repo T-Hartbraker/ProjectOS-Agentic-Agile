@@ -1,4 +1,4 @@
-﻿# Virtualenvs and Python caches
+# Virtualenvs and Python caches
 .venv/
 __pycache__/
 *.pyc
@@ -23,6 +23,7 @@ state/*.db-shm
 state/*.db-wal
 state/*.pid
 state/*.lock
+state/*.enc
 
 # Run evidence / agent artifacts (FAT evidence stays local, not in Git)
 logs/*
@@ -31,6 +32,11 @@ logs/*
 # Ad-hoc local inspection scripts
 _inspect*.py
 _cursor_adapter_new.py
+
+# Dashboard
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
 
 # Editor / OS noise
 .DS_Store

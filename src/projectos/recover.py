@@ -19,6 +19,7 @@ from projectos.store import (
     get_job_by_human_id,
     list_jobs_by_statuses,
     list_jobs_for_project,
+    list_expired_lease_job_ids,
     mark_blocked,
     mark_ready_from_blocked,
     promote_retry_wait_to_ready,
@@ -646,12 +647,94 @@ def _collect_unknown_worktrees(
     return ignored
 
 
+def preview_recovery(
+    *,
+    db_path: Path | str | None = None,
+    registry_path: Path | str | None = None,
+    projectctl_runner=None,
+    project_human_id: str | None = None,
+) -> RecoveryReport:
+    """Describe recovery actions without mutating jobs, leases, or worktrees."""
+    path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    reg_path = (
+        Path(registry_path) if registry_path is not None else DEFAULT_REGISTRY_PATH
+    )
+    initialize_database(path)
+    report = RecoveryReport()
+    with connection(path) as conn:
+        expired_ids = list_expired_lease_job_ids(
+            conn, project_human_id=project_human_id
+        )
+        report.expired_lease_job_ids = list(expired_ids)
+        if expired_ids:
+            report.messages.append(
+                f"Would recover {len(expired_ids)} expired lease(s)"
+            )
+        if project_human_id:
+            active_jobs = list_jobs_for_project(
+                conn, project_human_id, statuses=RECOVERY_ACTIVE_STATUSES
+            )
+        else:
+            active_jobs = list_jobs_by_statuses(conn, RECOVERY_ACTIVE_STATUSES)
+        seen_pairs: set[tuple[str, str]] = set()
+        identity_bad: dict[str, str] = {}
+        identity_ok: set[str] = set()
+        for job in active_jobs:
+            pair = (
+                job.project_human_id,
+                str(Path(job.repository_root).resolve()),
+            )
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            check = _check_project_identity(
+                job.project_human_id,
+                expected_repository_root=job.repository_root,
+                registry_path=reg_path,
+                projectctl_runner=projectctl_runner,
+            )
+            report.identity_checks.append(check)
+            if check.ok:
+                identity_ok.add(pair[0])
+            else:
+                identity_bad[pair[0]] = check.error or "identity validation failed"
+                report.messages.append(
+                    f"Would block {pair[0]}: {check.error}"
+                )
+        for project_id, error in identity_bad.items():
+            for job in list_jobs_for_project(
+                conn, project_id, statuses=RECOVERY_ACTIVE_STATUSES
+            ):
+                report.blocked.append(job.human_id)
+        retry_jobs = list_jobs_by_statuses(conn, {"RETRY_WAIT"})
+        if project_human_id:
+            retry_jobs = [
+                j for j in retry_jobs if j.project_human_id == project_human_id
+            ]
+        for job in retry_jobs:
+            if job.project_human_id in identity_bad:
+                continue
+            report.promoted_ready.append(job.human_id)
+        for job in active_jobs:
+            if job.worktree_name or job.worktree_path:
+                report.worktree_actions.append(
+                    WorktreeReconcileResult(
+                        job_human_id=job.human_id,
+                        action="inspect",
+                        message="Would inspect recorded worktree (no mutate)",
+                    )
+                )
+        report.messages.append("preview: no writes performed")
+    return report
+
+
 def run_recovery(
     *,
     db_path: Path | str | None = None,
     registry_path: Path | str | None = None,
     projectctl_runner=None,
     promote_retry_wait: bool = True,
+    project_human_id: str | None = None,
 ) -> RecoveryReport:
     """Run full ProjectOS recovery pass."""
     path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
@@ -662,7 +745,9 @@ def run_recovery(
     report = RecoveryReport()
 
     with connection(path) as conn:
-        recovered_ids = recover_expired_leases(conn)
+        recovered_ids = recover_expired_leases(
+            conn, project_human_id=project_human_id
+        )
         report.expired_lease_job_ids = list(recovered_ids)
         if recovered_ids:
             report.messages.append(
@@ -671,6 +756,13 @@ def run_recovery(
 
         active_jobs = list_jobs_by_statuses(conn, RECOVERY_ACTIVE_STATUSES)
         recovered_jobs = [get_job(conn, jid) for jid in recovered_ids]
+        if project_human_id:
+            active_jobs = [
+                j for j in active_jobs if j.project_human_id == project_human_id
+            ]
+            recovered_jobs = [
+                j for j in recovered_jobs if j.project_human_id == project_human_id
+            ]
 
         identity_ok_projects: set[str] = set()
         identity_bad: dict[str, str] = {}
@@ -722,6 +814,8 @@ def run_recovery(
 
         if promote_retry_wait:
             for job in list_jobs_by_statuses(conn, {"RETRY_WAIT"}):
+                if project_human_id and job.project_human_id != project_human_id:
+                    continue
                 if job.project_human_id in identity_bad:
                     continue
                 if job.project_human_id not in identity_ok_projects:
@@ -752,6 +846,11 @@ def run_recovery(
             for j in reconcile_jobs
             if j.worktree_name or j.worktree_path or j.id in set(recovered_ids)
         ]
+        if project_human_id:
+            targets = [j for j in targets if j.project_human_id == project_human_id]
+            reconcile_jobs = [
+                j for j in reconcile_jobs if j.project_human_id == project_human_id
+            ]
         known_paths_by_repo: dict[str, set[Path]] = {}
         for job in targets:
             if job.worktree_path:

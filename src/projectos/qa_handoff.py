@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from projectos.constants import ASSURANCE_QUEUES, QUEUE_TO_ROLE
+from projectos.constants import ASSURANCE_QUEUES, CODE_MODIFYING_ROLES, QUEUE_TO_ROLE
 from projectos.db import connection
 from projectos.delivery_evidence import is_valid_qa_candidate
 from projectos.errors import OrchestrationError
@@ -17,6 +17,7 @@ from projectos.store import (
     append_run_event,
     create_job,
     get_job,
+    insert_qa_evidence,
     set_job_source_provenance,
     utc_now_iso,
 )
@@ -90,21 +91,15 @@ def create_assurance_jobs_for_delivery(
             source_candidate_sha=candidate_git_sha,
         )
         add_job_dependency(conn, job.id, delivery.id)
-        conn.execute(
-            """
-            INSERT INTO qa_evidence (
-                project_human_id, repository_root, delivery_job_id,
-                assurance_job_id, candidate_git_sha, assurance_role, result
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
-            """,
-            (
-                delivery.project_human_id,
-                delivery.repository_root,
-                delivery.id,
-                job.id,
-                candidate_git_sha,
-                queue,
-            ),
+        insert_qa_evidence(
+            conn,
+            project_human_id=delivery.project_human_id,
+            repository_root=delivery.repository_root,
+            delivery_job_id=delivery.id,
+            assurance_job_id=job.id,
+            candidate_git_sha=candidate_git_sha,
+            assurance_role=queue,
+            result="pending",
         )
         created.append(human_id)
 
@@ -164,6 +159,13 @@ def record_assurance_result(
     create_defect_fn=None,
 ) -> None:
     """Record QA result; reject stale evidence against a newer candidate."""
+    if (
+        assurance.queue not in ASSURANCE_QUEUES
+        or assurance.agent_role in CODE_MODIFYING_ROLES
+    ):
+        raise OrchestrationError(
+            "Developer runs cannot record QA results; independent assurance only"
+        )
     expected = assurance.source_candidate_sha
     if not expected:
         raise OrchestrationError("Assurance job missing source_candidate_sha")
@@ -204,6 +206,29 @@ def record_assurance_result(
         """,
         (result, evidence_ref, assurance.id, expected),
     )
+
+    from projectos.domain_events import lookup_event_context_for_project
+    from projectos.qa_gate import emit_qa_finding_created, emit_qa_gate_evaluation
+
+    event_ctx = lookup_event_context_for_project(conn, assurance.project_human_id)
+    if event_ctx is not None:
+        if not passed:
+            emit_qa_finding_created(
+                conn,
+                event_context=event_ctx,
+                summary=f"QA finding on {assurance.queue} for {expected}",
+                evidence={
+                    "assurance_role": assurance.queue,
+                    "job_id": assurance.human_id,
+                    "candidate_git_sha": expected,
+                    "result": result,
+                },
+            )
+        emit_qa_gate_evaluation(
+            conn,
+            project_id=assurance.project_human_id,
+            event_context=event_ctx,
+        )
 
     if not passed:
         defect_id = None

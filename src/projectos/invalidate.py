@@ -24,6 +24,7 @@ from projectos.store import (
     append_run_event,
     create_job,
     get_job_by_human_id,
+    insert_candidate_invalidation,
     mark_cancelled,
     set_job_outcome,
 )
@@ -219,18 +220,12 @@ def invalidate_delivery_candidate(
         outcome="INVALIDATED",
         superseded_by_job_id=rework.id,
     )
-    conn.execute(
-        """
-        INSERT INTO candidate_invalidations (
-            delivery_job_id, invalidated_candidate_sha, reason, rework_job_id
-        ) VALUES (?, ?, ?, ?)
-        """,
-        (
-            delivery.id,
-            delivery.candidate_git_sha,
-            reason,
-            rework.id,
-        ),
+    insert_candidate_invalidation(
+        conn,
+        delivery_job_id=delivery.id,
+        invalidated_candidate_sha=delivery.candidate_git_sha,
+        reason=reason,
+        rework_job_id=rework.id,
     )
     append_run_event(
         conn,

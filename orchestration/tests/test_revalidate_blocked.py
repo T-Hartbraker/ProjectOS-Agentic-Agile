@@ -15,6 +15,7 @@ from projectos.store import (
     mark_blocked,
 )
 from projectos.worker import run_once
+from projectos.worktree import current_head_sha
 
 from orch_helpers import init_git_repo, make_cursor_runner, seed_db, write_registry
 
@@ -97,7 +98,7 @@ def test_missing_ac_blocks_delivery(tmp_path: Path) -> None:
             requires_worktree=True,
             work_item_type="story",
             work_item_human_id="US-007",
-            base_git_sha="abc",
+            base_git_sha=current_head_sha(repo),
             assignment={
                 "requirement_ref": "story:US-007",
                 "title": "Due date",

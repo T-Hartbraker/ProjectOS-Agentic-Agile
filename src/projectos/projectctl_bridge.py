@@ -89,6 +89,7 @@ def run_projectctl(
     python_executable: Path | None = None,
     timeout_seconds: float = 120.0,
     require_zero: bool = False,
+    db_path: Path | None = None,
 ) -> ProjectctlResult:
     root = Path(repository_root).resolve()
     python = (
@@ -96,7 +97,10 @@ def run_projectctl(
         if python_executable is not None
         else find_repository_python(root)
     )
-    cmd = [str(python), "-m", "projectctl", "--repo-root", str(root), *list(args)]
+    prefix = ["--repo-root", str(root)]
+    if db_path is not None:
+        prefix.extend(["--db", str(Path(db_path).resolve())])
+    cmd = [str(python), "-m", "projectctl", *prefix, *list(args)]
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     started_at = _iso_now()
@@ -188,14 +192,16 @@ def resolve_validated_repo(
     *,
     registry_path: Path | str | None = None,
     projectctl_runner=None,
+    claimed_repository_root: Path | str | None = None,
 ):
-    from projectos.validation import validate_registry_entry
+    from projectos.project_context import resolve_project_context
 
-    registry = load_registry(registry_path)
-    entry = registry.get(project_human_id)
-    if entry is None:
-        raise RegistryError(f"Project {project_human_id!r} is not in the registry")
-    return validate_registry_entry(entry, projectctl_runner=projectctl_runner)
+    return resolve_project_context(
+        project_human_id,
+        registry_path=registry_path,
+        claimed_repository_root=claimed_repository_root,
+        projectctl_runner=projectctl_runner,
+    ).to_validated_project()
 
 
 def projectctl_for_project(

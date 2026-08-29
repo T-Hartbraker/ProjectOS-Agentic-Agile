@@ -142,6 +142,44 @@ def plan_text_from_cursor_result(cursor: CursorRunResult) -> str:
     return "\n".join(chunks).strip()
 
 
+def _ensure_release_depends_on_integration(jobs: list[Any]) -> list[str]:
+    """Require every RELEASE job to depend on an INTEGRATION job in the plan.
+
+    If a RELEASE job omits the edge and the plan has exactly one INTEGRATION
+    job, that dependency is added deterministically.
+    """
+    errors: list[str] = []
+    integration_ids = [
+        str(job.get("human_id"))
+        for job in jobs
+        if isinstance(job, dict)
+        and job.get("queue") == "INTEGRATION"
+        and isinstance(job.get("human_id"), str)
+    ]
+    for job in jobs:
+        if not isinstance(job, dict) or job.get("queue") != "RELEASE":
+            continue
+        hid = job.get("human_id")
+        deps = [str(d) for d in (job.get("depends_on") or [])]
+        if any(dep in integration_ids for dep in deps):
+            job["depends_on"] = deps
+            continue
+        if len(integration_ids) == 1:
+            deps.append(integration_ids[0])
+            job["depends_on"] = deps
+            continue
+        if not integration_ids:
+            errors.append(
+                f"job {hid}: RELEASE requires a depends_on INTEGRATION job"
+            )
+        else:
+            errors.append(
+                f"job {hid}: RELEASE must depend_on an INTEGRATION job "
+                f"(ambiguous candidates {integration_ids})"
+            )
+    return errors
+
+
 def validate_plan_document(
     plan: dict[str, Any],
     *,
@@ -220,6 +258,8 @@ def validate_plan_document(
         if not isinstance(deps, list):
             errors.append(f"{prefix}.depends_on must be an array")
 
+    errors.extend(_ensure_release_depends_on_integration(jobs))
+
     by_id = {
         j.get("human_id"): j
         for j in jobs
@@ -250,8 +290,13 @@ def validate_plan_document(
     return errors
 
 
-def _build_pm_prompt(project_human_id: str, iteration_human_id: str | None) -> str:
-    return (
+def _build_pm_prompt(
+    project_human_id: str,
+    iteration_human_id: str | None,
+    *,
+    work_request: dict[str, Any] | None = None,
+) -> str:
+    base = (
         "You are the Project Manager for ProjectOS. Produce ONLY a JSON object "
         f"matching schema_version={PLAN_SCHEMA_VERSION} for project "
         f"{project_human_id}. Include sponsor_authority, optional "
@@ -259,9 +304,27 @@ def _build_pm_prompt(project_human_id: str, iteration_human_id: str | None) -> s
         "work_item_type, work_item_human_id, depends_on, priority. "
         "Every DELIVERY job MUST include work_item_type and work_item_human_id "
         "resolvable in projectctl (preferred), or requirement_ref plus "
-        "acceptance_criteria[]. Do not execute engineering work. Do not create "
+        "acceptance_criteria[]. Every RELEASE job MUST depend_on the iteration "
+        "INTEGRATION job and is not READY until that INTEGRATION job SUCCEEDED "
+        "with a valid candidate. Do not execute engineering work. Do not create "
         "a new project. Do not write files. Reply with the JSON document only.\n"
         f"iteration_human_id hint: {iteration_human_id or 'none'}\n"
+    )
+    if not work_request:
+        return base
+    return (
+        base
+        + "\nWork intake (business intent only). You retain delegated technical "
+        "authority: do not ask the operator implementation questions (queues, "
+        "job split, architecture, libraries). Put those in assumptions[]. "
+        "If sponsor-reserved ambiguity remains (scope expansion, production "
+        "release, policy exception, missing testable acceptance), list it in "
+        "sponsor_decision_requests[] as {code, question}. Do not invent "
+        "sponsor_authority=approved.\n"
+        f"business_request: {work_request.get('business_request')}\n"
+        f"objective: {work_request.get('objective')}\n"
+        f"acceptance: {work_request.get('acceptance')}\n"
+        f"sponsor_authority provided: {work_request.get('sponsor_authority') or 'none'}\n"
     )
 
 
@@ -289,6 +352,13 @@ def _load_latest_accepted_plan(
     return data if isinstance(data, dict) else None
 
 
+def load_latest_accepted_plan(
+    conn, project_human_id: str
+) -> dict[str, Any] | None:
+    """Public replay source for dry-run and inspection."""
+    return _load_latest_accepted_plan(conn, project_human_id)
+
+
 def run_plan(
     *,
     project_human_id: str,
@@ -299,6 +369,7 @@ def run_plan(
     cursor_runner: Callable[..., Any] | None = None,
     projectctl_runner=None,
     plan_override: dict[str, Any] | None = None,
+    work_request: dict[str, Any] | None = None,
 ) -> PlanResult:
     path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
     reg_path = Path(registry_path) if registry_path is not None else DEFAULT_REGISTRY_PATH
@@ -328,11 +399,11 @@ def run_plan(
     if plan_override is not None:
         plan = plan_override
         plan_source = "override"
-    elif dry_run:
+    elif dry_run and work_request is None:
         # Dry-run must not launch engineering work and must remain safe when an
         # accepted plan already exists. Prefer replaying the latest accepted
         # plan (same schema validation, zero job writes). Only invoke Cursor
-        # when no accepted plan is available yet.
+        # when no accepted plan is available yet. A new work_request skips replay.
         with connection(path) as conn:
             replay = _load_latest_accepted_plan(conn, project_human_id)
         if replay is not None:
@@ -364,9 +435,12 @@ def run_plan(
                     output_ref=output_ref,
                 )
     else:
-        # Live accept path: require Cursor (or override) to produce a plan.
-        # Do NOT use --mode=plan: that mode often yields empty --print stdout.
-        prompt = _build_pm_prompt(project_human_id, iteration_human_id)
+        # Accept path, or dry-run for a new work_request (do not replay).
+        prompt = _build_pm_prompt(
+            project_human_id,
+            iteration_human_id,
+            work_request=work_request,
+        )
         cursor = invoke_cursor_agent(
             prompt=prompt,
             workspace=validated.git_root,
@@ -382,7 +456,7 @@ def run_plan(
             return PlanResult(
                 status="error",
                 project_human_id=project_human_id,
-                dry_run=False,
+                dry_run=dry_run,
                 error=f"PM Cursor exit {cursor.returncode}",
                 output_ref=output_ref,
             )
@@ -394,7 +468,7 @@ def run_plan(
             return PlanResult(
                 status="error",
                 project_human_id=project_human_id,
-                dry_run=False,
+                dry_run=dry_run,
                 error=str(exc),
                 output_ref=output_ref,
             )
@@ -486,13 +560,18 @@ def run_plan(
                 repository_root=validated.git_root,
                 agent_role=role,
                 queue=queue,
-                status="READY",
+                status="QUEUED" if queue == "RELEASE" else "READY",
                 priority=int(job.get("priority", 100)),
                 iteration_human_id=iteration_human_id
                 or plan.get("iteration_human_id"),
                 work_item_type=job.get("work_item_type"),
                 work_item_human_id=job.get("work_item_human_id"),
-                requires_worktree=role in {"DELIVERY", "ARCHITECTURE", "INTEGRATION"},
+                requires_worktree=role in {
+                    "DELIVERY",
+                    "ARCHITECTURE",
+                    "INTEGRATION",
+                    "RELEASE",
+                },
                 identity_snapshot=identity,
                 assignment=_assignment_from_plan_job(job),
                 allows_no_change=bool(job.get("allows_no_change", False)),

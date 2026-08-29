@@ -43,6 +43,18 @@ def current_head_sha(repository_root: Path) -> str:
     return _run_git(["rev-parse", "HEAD"], cwd=repository_root).strip()
 
 
+def checkout_sha(worktree_path: Path, sha: str) -> str:
+    """Detach worktree HEAD at an existing commit. Refuses a dirty tree."""
+    if is_dirty(worktree_path):
+        raise WorktreeError(f"Cannot checkout {sha}: worktree is dirty")
+    if not sha_belongs_to_repo(worktree_path, sha):
+        raise WorktreeError(
+            f"SHA {sha} is not present in worktree {worktree_path}"
+        )
+    _run_git(["checkout", "--detach", sha], cwd=worktree_path)
+    return current_head_sha(worktree_path)
+
+
 def is_dirty(worktree_path: Path) -> bool:
     out = _run_git(["status", "--porcelain"], cwd=worktree_path)
     return bool(out.strip())
@@ -70,6 +82,32 @@ def sha_belongs_to_repo(worktree_path: Path, sha: str) -> bool:
         return True
     except GitRepositoryError:
         return False
+
+
+def is_ancestor(worktree_path: Path, ancestor_sha: str, descendant_sha: str) -> bool:
+    """True when ancestor_sha is an ancestor of descendant_sha (inclusive)."""
+    try:
+        _run_git(
+            ["merge-base", "--is-ancestor", ancestor_sha, descendant_sha],
+            cwd=worktree_path,
+        )
+        return True
+    except GitRepositoryError:
+        return False
+
+
+def resolve_worktree_entry(
+    repository_root: Path, worktree_path: Path
+) -> dict[str, str] | None:
+    """Return porcelain worktree entry for path, or None if not registered."""
+    target = Path(worktree_path).resolve()
+    for entry in list_worktrees(Path(repository_root)):
+        raw = entry.get("worktree")
+        if not raw:
+            continue
+        if Path(raw).resolve() == target:
+            return entry
+    return None
 
 
 def common_git_dir(path: Path) -> Path:

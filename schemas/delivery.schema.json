@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProjectOS Delivery Contract",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "delivery_type",
+    "target_platforms",
+    "packaging_adapter",
+    "repository_provider",
+    "repository_owner",
+    "repository_name",
+    "default_branch",
+    "release_strategy",
+    "installer_format",
+    "installer_name_template",
+    "code_signing_policy",
+    "sbom_policy",
+    "checksum_policy",
+    "github_release_enabled",
+    "slack_release_announcement_enabled"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "delivery_type": {
+      "type": "string",
+      "enum": ["desktop_application", "cli_tool", "web_application", "library"]
+    },
+    "target_platforms": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+      "minItems": 1
+    },
+    "packaging_adapter": {
+      "type": "string",
+      "enum": ["auto", "python_desktop", "dotnet_desktop", "electron", "generic"]
+    },
+    "repository_provider": { "type": "string", "enum": ["github"] },
+    "repository_owner": { "type": "string", "minLength": 1 },
+    "repository_name": { "type": "string", "minLength": 1 },
+    "default_branch": { "type": "string", "minLength": 1 },
+    "release_strategy": { "type": "string", "enum": ["semantic_version"] },
+    "installer_format": { "type": "string" },
+    "installer_name_template": { "type": "string", "minLength": 1 },
+    "artifact_retention": { "type": "integer", "minimum": 1 },
+    "code_signing_policy": {
+      "type": "string",
+      "enum": ["not_required", "required_for_production", "optional"]
+    },
+    "sbom_policy": { "type": "string", "enum": ["required", "optional", "disabled"] },
+    "checksum_policy": { "type": "string", "enum": ["sha256"] },
+    "github_release_enabled": { "type": "boolean" },
+    "slack_release_announcement_enabled": { "type": "boolean" },
+    "product_name": { "type": "string" },
+    "entry_point": { "type": "string" },
+    "trusted_build_command": { "type": "string" }
+  },
+  "additionalProperties": false
+}

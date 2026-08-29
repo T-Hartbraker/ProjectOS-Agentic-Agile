@@ -10,7 +10,7 @@ from pathlib import Path
 from projectos.db import connection
 from projectos.errors import GitRepositoryError, OrchestrationError
 from projectos.gitutil import resolve_git_root
-from projectos.store import utc_now_iso
+from projectos.store import insert_integration_run, utc_now_iso
 
 
 @dataclass(frozen=True)
@@ -57,23 +57,16 @@ def integrate_candidates(
     run_id = None
     if db_path is not None:
         with connection(db_path) as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO integration_runs (
-                    project_human_id, repository_root, iteration_human_id,
-                    source_job_ids_json, source_shas_json, status, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'integrating', ?)
-                """,
-                (
-                    project_human_id,
-                    str(root),
-                    iteration_human_id,
-                    json.dumps(source_job_ids),
-                    json.dumps(source_shas),
-                    now,
-                ),
+            run_id = insert_integration_run(
+                conn,
+                project_human_id=project_human_id,
+                repository_root=root,
+                iteration_human_id=iteration_human_id,
+                source_job_ids=source_job_ids,
+                source_shas=source_shas,
+                status="integrating",
+                updated_at=now,
             )
-            run_id = int(cur.lastrowid)
 
     try:
         # Ensure integration branch from first parent HEAD of main/master/current

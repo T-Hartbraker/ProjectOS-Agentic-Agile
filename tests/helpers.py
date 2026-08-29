@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -62,43 +63,79 @@ def write_identity(
 
 def init_git_repo(repo_root: Path) -> Path:
     repo_root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "init"],
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+    init = subprocess.run(
+        ["git", "init", "-b", "main"],
         cwd=repo_root,
-        check=True,
         capture_output=True,
         text=True,
+        env=env,
     )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    if init.returncode != 0:
+        subprocess.run(
+            ["git", "init"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        subprocess.run(
+            ["git", "checkout", "-B", "main"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
     marker = repo_root / ".gitkeep"
-    marker.write_text("", encoding="utf-8")
+    marker.write_text(f"init-{repo_root.name}\n", encoding="utf-8")
     subprocess.run(
         ["git", "add", ".gitkeep"],
         cwd=repo_root,
         check=True,
         capture_output=True,
         text=True,
+        env=env,
     )
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    commit_cmd = [
+        "git",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-m",
+        "init",
+    ]
+    for attempt in range(3):
+        result = subprocess.run(
+            commit_cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if result.returncode == 0:
+            break
+        combined = f"{result.stdout}\n{result.stderr}".lower()
+        if "nothing to commit" in combined or "nothing added to commit" in combined:
+            return repo_root.resolve()
+        if attempt == 2:
+            raise subprocess.CalledProcessError(
+                result.returncode, commit_cmd, result.stdout, result.stderr
+            )
+        import time
+
+        time.sleep(0.05 * (attempt + 1))
     return repo_root.resolve()
 
 

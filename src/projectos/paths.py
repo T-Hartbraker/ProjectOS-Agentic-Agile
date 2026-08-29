@@ -14,3 +14,12 @@ DEFAULT_DB_PATH = STATE_DIR / "projectos.db"
 MIGRATIONS_DIR = PROJECTOS_ROOT / "migrations"
 LOGS_DIR = PROJECTOS_ROOT / "logs"
 RUN_OUTPUT_DIR = LOGS_DIR / "runs"
+DASHBOARD_DIST = PROJECTOS_ROOT / "web" / "dist"
+
+
+def dashboard_index() -> Path:
+    return DASHBOARD_DIST / "index.html"
+
+
+def dashboard_is_built() -> bool:
+    return dashboard_index().is_file()

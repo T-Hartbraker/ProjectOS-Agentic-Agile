@@ -101,6 +101,16 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _read_lock_pid(lock_path: str | Path | None) -> int | None:
+    if not lock_path:
+        return None
+    try:
+        pid = int(Path(lock_path).read_text(encoding="utf-8").strip() or "0")
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
 def get_daemon_status(db_path: Path | str | None = None) -> DaemonStatus:
     path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
     initialize_database(path)
@@ -108,13 +118,20 @@ def get_daemon_status(db_path: Path | str | None = None) -> DaemonStatus:
         row = conn.execute("SELECT * FROM daemon_state WHERE id = 1").fetchone()
         if row is None:
             return DaemonStatus("stopped", None, None, None, None, None)
+        pid = int(row["pid"]) if row["pid"] is not None else None
+        lock_path = row["lock_path"]
+        status = str(row["status"])
+        if pid is None and status == "running":
+            pid = _read_lock_pid(lock_path)
+        if pid and status == "running" and row["pid"] is None and _pid_alive(pid):
+            _persist_daemon(conn, pid=pid, status="running")
         return DaemonStatus(
-            status=str(row["status"]),
-            pid=int(row["pid"]) if row["pid"] is not None else None,
+            status=status,
+            pid=pid,
             heartbeat_at=row["heartbeat_at"],
             started_at=row["started_at"],
             last_error=row["last_error"],
-            lock_path=row["lock_path"],
+            lock_path=lock_path,
         )
 
 
@@ -184,9 +201,16 @@ def run_daemon(
                     skip_identity_validation=skip_identity_validation,
                     max_waves=1,
                 )
+                from projectos.event_dispatcher import dispatch_event_outbox
+
+                dispatch_event_outbox(path)
                 with connection(path) as conn:
                     _persist_daemon(
-                        conn, heartbeat_at=utc_now_iso(), status="running", last_error=None
+                        conn,
+                        heartbeat_at=utc_now_iso(),
+                        status="running",
+                        last_error=None,
+                        pid=os.getpid(),
                     )
             except OrchestrationError as exc:
                 with connection(path) as conn:

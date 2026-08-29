@@ -1,0 +1,36 @@
+display_information:
+  name: ProjectOS
+  description: Local operator control plane across ProjectOS projects.
+  background_color: "#1a1d23"
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+  bot_user:
+    display_name: ProjectOS
+    always_online: true
+  slash_commands:
+    - command: /projectos
+      description: Ask ProjectOS about your projects
+      usage_hint: "status | use PRJ-003 | projects | help"
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - commands
+      - chat:write
+      - app_mentions:read
+      - im:history
+      - groups:history
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+      - message.groups
+      - message.channels
+  socket_mode_enabled: true
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  token_rotation_enabled: false

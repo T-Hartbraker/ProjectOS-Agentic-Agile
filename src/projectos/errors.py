@@ -35,6 +35,14 @@ class OrchestrationError(ProjectOSError):
     """Orchestration state or job lifecycle failure."""
 
 
+class ConflictError(OrchestrationError):
+    """Concurrent operation or idempotency-key reuse with a different payload."""
+
+
+class CrossProjectWriteError(OrchestrationError):
+    """Write attempted to link or persist state across project boundaries."""
+
+
 class LeaseError(OrchestrationError):
     """Lease acquisition, renewal, or release failed."""
 
@@ -49,3 +57,7 @@ class CursorAdapterError(OrchestrationError):
 
 class WorkerError(OrchestrationError):
     """Worker runtime failure."""
+
+
+class AuthorizationError(ProjectOSError):
+    """Caller is not allowed to perform this action."""
