@@ -1,7 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "delivery-project"
+name = "agentic-project-control"
 version = "0.1.0"
 requires-python = ">=3.11"
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[tool.setuptools]
+package-dir = {"" = "project-control/src"}
+
+[tool.setuptools.packages.find]
+where = ["project-control/src"]

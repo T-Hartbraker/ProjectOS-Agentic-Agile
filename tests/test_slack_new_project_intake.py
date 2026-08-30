@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from helpers import fake_status, init_git_repo, write_identity, write_registry
+from projectos.cursor_adapter import CursorRunResult
 from projectos.db import connection
+from projectos.errors import ProjectctlError
 from projectos.migrate import initialize_database
 from projectos.project_context import resolve_project_context
-from projectos.project_creation import allocate_project_id, create_project_from_sponsor_request
+from projectos.project_creation import (
+    allocate_project_id,
+    validate_project_control_state,
+)
+from projectos.projectctl_bridge import run_projectctl_status
 from projectos.registry import load_registry
 from projectos.repository import load_repository_identity
 from projectos.services.context import ServiceContext
@@ -31,17 +39,51 @@ FAT_MESSAGE = (
 )
 
 
+@pytest.fixture
+def fast_plan_cursor(monkeypatch):
+    def _fake_cursor(**kwargs):
+        return CursorRunResult(
+            command=[],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "project_human_id": "PRJ-004",
+                    "iteration_human_id": "ITER-001",
+                    "jobs": [],
+                }
+            ),
+            stderr="",
+            started_at=datetime.now(timezone.utc).isoformat(),
+            ended_at=datetime.now(timezone.utc).isoformat(),
+            duration_ms=1,
+            output_ref="test-plan",
+            stdout_ref="test-plan-out",
+            stderr_ref="test-plan-err",
+            prompt_ref=None,
+            workspace=kwargs.get("workspace", Path.cwd()),
+            worktree_name=None,
+            usage=None,
+        )
+
+    monkeypatch.setattr("projectos.plan.invoke_cursor_agent", _fake_cursor)
+
+
 def _runner(human_id: str):
     return lambda root: fake_status(human_id)
 
 
 def _write_defaults(tmp_path: Path, projects_root: Path) -> Path:
+    from projectos.paths import PROJECTOS_ROOT
+
     path = tmp_path / "project_defaults.json"
     path.write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "projects_root": str(projects_root.resolve()),
+                "delivery_template_root": str(
+                    (PROJECTOS_ROOT / "templates" / "delivery-project").resolve()
+                ),
             }
         ),
         encoding="utf-8",
@@ -98,26 +140,12 @@ def test_classify_projectos_intent_cases(text: str, expected: SlackIntent) -> No
 
 
 def test_direct_projectos_new_project_request_creates_project_and_starts_run(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fast_plan_cursor
 ) -> None:
     monkeypatch.setenv("PROJECTOS_SLACK_BOT_TOKEN", "xoxb-test")
     ctx, defaults_path = _ctx(tmp_path)
     projects_root = json.loads(defaults_path.read_text(encoding="utf-8"))["projects_root"]
     monkeypatch.setenv("PROJECTOS_PROJECTS_ROOT", projects_root)
-
-    from projectos.onboarding import register_project as real_register
-
-    def _register(path, *, registry_path=None, projectctl_runner=None, **kwargs):
-        from projectos.repository import load_repository_identity
-
-        human_id = load_repository_identity(path).project_human_id
-        return real_register(
-            path,
-            registry_path=registry_path,
-            projectctl_runner=_runner(human_id),
-        )
-
-    monkeypatch.setattr("projectos.project_creation.register_project", _register)
 
     reply = handle_events_api_payload(
         ctx,
@@ -145,11 +173,34 @@ def test_direct_projectos_new_project_request_creates_project_and_starts_run(
     assert (repo / "project" / "delivery.json").is_file()
     delivery = json.loads((repo / "project" / "delivery.json").read_text(encoding="utf-8"))
     assert delivery["installer_format"] == "zip"
+    assert not (repo / "project-control" / ".projectctl-bootstrap").exists()
+
+    db_path = repo / "project-control" / "project.db"
+    assert db_path.stat().st_size > 0
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert "projects" in tables
+        active = conn.execute(
+            "SELECT human_id FROM projects WHERE is_active = 1"
+        ).fetchone()
+        assert active is not None
+        assert active[0] == "PRJ-004"
+
+    venv_python = repo / ".venv" / "Scripts" / "python.exe"
+    validate_project_control_state(
+        repo, project_human_id="PRJ-004", python_executable=venv_python
+    )
+    status = run_projectctl_status(repo)
+    assert "PRJ-004" in status.stdout
 
     project_ctx = resolve_project_context(
         "PRJ-004",
         registry_path=ctx.registry_path,
-        projectctl_runner=_runner("PRJ-004"),
     )
     assert project_ctx.project_human_id == "PRJ-004"
 
@@ -234,25 +285,11 @@ def test_add_feature_to_existing_project_does_not_create_project(tmp_path: Path)
     assert {entry.project_human_id for entry in registry.projects} == {"PRJ-003"}
 
 
-def test_duplicate_slack_event_is_idempotent(tmp_path: Path, monkeypatch) -> None:
+def test_duplicate_slack_event_is_idempotent(tmp_path: Path, monkeypatch, fast_plan_cursor) -> None:
     monkeypatch.setenv("PROJECTOS_SLACK_BOT_TOKEN", "xoxb-test")
     ctx, defaults_path = _ctx(tmp_path)
     projects_root = json.loads(defaults_path.read_text(encoding="utf-8"))["projects_root"]
     monkeypatch.setenv("PROJECTOS_PROJECTS_ROOT", projects_root)
-
-    from projectos.onboarding import register_project as real_register
-
-    def _register(path, *, registry_path=None, projectctl_runner=None, **kwargs):
-        from projectos.repository import load_repository_identity
-
-        human_id = load_repository_identity(path).project_human_id
-        return real_register(
-            path,
-            registry_path=registry_path,
-            projectctl_runner=_runner(human_id),
-        )
-
-    monkeypatch.setattr("projectos.project_creation.register_project", _register)
 
     payload = _mention_event(text=FAT_MESSAGE, event_id="EvDup", ts="203.0")
     first = handle_events_api_payload(ctx, payload, bot_user_id="UBOT")
@@ -313,3 +350,42 @@ def test_allocator_skips_disabled_ids(tmp_path: Path) -> None:
     with connection(ctx.db_path) as conn:
         allocated = allocate_project_id(conn, registry_path=ctx.registry_path)
     assert allocated == "PRJ-011"
+
+
+def test_projectctl_init_failure_rolls_back_without_synthetic_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("PROJECTOS_SLACK_BOT_TOKEN", "xoxb-test")
+    ctx, defaults_path = _ctx(tmp_path)
+    projects_root = Path(
+        json.loads(defaults_path.read_text(encoding="utf-8"))["projects_root"]
+    )
+    monkeypatch.setenv("PROJECTOS_PROJECTS_ROOT", str(projects_root))
+
+    def _fail_projectctl(*args, **kwargs):
+        raise ProjectctlError("simulated projectctl initialization failure")
+
+    monkeypatch.setattr("projectos.project_creation._initialize_projectctl", _fail_projectctl)
+
+    reply = handle_events_api_payload(
+        ctx,
+        _mention_event(text=FAT_MESSAGE, event_id="EvFail", ts="204.0"),
+        bot_user_id="UBOT",
+    )
+    assert reply is not None
+    assert "projectctl initialization" in reply["text"].casefold()
+
+    registry = load_registry(ctx.registry_path)
+    assert {entry.project_human_id for entry in registry.projects} == {"PRJ-003"}
+    remaining = [path for path in projects_root.glob("*") if path.is_dir()]
+    assert remaining == []
+
+    with connection(ctx.db_path) as conn:
+        handoffs = conn.execute("SELECT COUNT(*) AS total FROM sponsor_handoffs").fetchone()
+        runs = conn.execute("SELECT COUNT(*) AS total FROM execution_runs").fetchone()
+        reservations = conn.execute(
+            "SELECT COUNT(*) AS total FROM project_id_reservations"
+        ).fetchone()
+    assert int(handoffs["total"]) == 0
+    assert int(runs["total"]) == 0
+    assert int(reservations["total"]) == 0

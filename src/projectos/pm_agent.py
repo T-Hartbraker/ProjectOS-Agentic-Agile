@@ -997,6 +997,7 @@ def _orchestrate_work_handoff(
     if is_work_mutation(proposal.action_type):
         from projectos.slack_chatgpt import _generate_and_persist_preview
 
+        conn.commit()
         preview_text = _generate_and_persist_preview(
             ctx, conn, proposal, explicit_new_project=explicit_new_project
         )

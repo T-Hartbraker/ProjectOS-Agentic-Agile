@@ -21,7 +21,12 @@ from projectos.migrate import initialize_database
 from projectos.onboarding import register_project
 from projectos.pm_agent import accept_sponsor_handoff
 from projectos.project_defaults import load_project_defaults
-from projectos.projectctl_bridge import ProjectctlStatusResult, run_projectctl
+from projectos.projectctl_bridge import (
+    ProjectctlStatusResult,
+    ensure_single_active_project,
+    run_projectctl,
+    run_projectctl_status,
+)
 from projectos.registry import load_registry_or_empty
 from projectos.repository import REPOSITORY_TYPE_DELIVERY_PROJECT
 from projectos.request_capability import classify_request
@@ -179,15 +184,141 @@ def _run_git(repo_root: Path, args: list[str]) -> None:
         raise OrchestrationError(f"git {' '.join(args)} failed: {detail}")
 
 
-def _ensure_repo_venv(repo_root: Path) -> Path:
+def _runtime_python() -> Path:
+    return Path(sys.executable).resolve()
+
+
+def _repository_venv_python(repo_root: Path) -> Path:
     if sys.platform == "win32":
-        target = repo_root / ".venv" / "Scripts" / "python.exe"
-    else:
-        target = repo_root / ".venv" / "bin" / "python"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.is_file():
-        shutil.copy(sys.executable, target)
-    return target.resolve()
+        return (repo_root / ".venv" / "Scripts" / "python.exe").resolve()
+    return (repo_root / ".venv" / "bin" / "python").resolve()
+
+
+def _projectctl_db_path(repo_root: Path) -> Path:
+    return (repo_root / "project-control" / "project.db").resolve()
+
+
+def _parse_prj_numeric_id(project_human_id: str) -> int:
+    match = _PRJ_NUM_RE.match(str(project_human_id or "").strip().upper())
+    if not match:
+        raise OrchestrationError(
+            f"Project creation requires numeric PRJ-### id (got {project_human_id!r})"
+        )
+    return int(match.group(1))
+
+
+def _create_repository_venv(repo_root: Path) -> Path:
+    venv_dir = repo_root / ".venv"
+    if venv_dir.exists():
+        shutil.rmtree(venv_dir, ignore_errors=True)
+    result = subprocess.run(
+        [str(_runtime_python()), "-m", "venv", str(venv_dir)],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise OrchestrationError(f"venv creation failed: {detail}")
+    python_executable = _repository_venv_python(repo_root)
+    if not python_executable.is_file():
+        raise OrchestrationError(
+            f"venv creation did not produce interpreter at {python_executable}"
+        )
+    return python_executable
+
+
+def _install_delivery_project_package(repo_root: Path, python_executable: Path) -> None:
+    result = subprocess.run(
+        [str(python_executable), "-m", "pip", "install", "-e", "."],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise OrchestrationError(f"delivery project package install failed: {detail}")
+
+
+def _seed_inactive_projects_for_id(
+    repo_root: Path,
+    *,
+    project_human_id: str,
+    python_executable: Path,
+) -> None:
+    target_num = _parse_prj_numeric_id(project_human_id)
+    db_path = _projectctl_db_path(repo_root)
+    for index in range(1, target_num):
+        run_projectctl(
+            repo_root,
+            [
+                "project",
+                "create",
+                "--name",
+                f"Bootstrap seed {index:03d}",
+                "--inactive",
+            ],
+            python_executable=python_executable,
+            db_path=db_path,
+            require_zero=True,
+        )
+
+
+def validate_project_control_state(
+    repo_root: Path,
+    *,
+    project_human_id: str,
+    python_executable: Path,
+) -> None:
+    """Prove project-control is initialized and matches repository identity."""
+    db_path = _projectctl_db_path(repo_root)
+    marker = repo_root / "project-control" / ".projectctl-bootstrap"
+    if marker.exists():
+        raise OrchestrationError(
+            "project-control contains synthetic bootstrap marker; refusing to register"
+        )
+    if not db_path.is_file() or db_path.stat().st_size == 0:
+        raise OrchestrationError(
+            f"project-control database missing or empty at {db_path}"
+        )
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise OrchestrationError(
+            f"project-control database is not readable SQLite at {db_path}: {exc}"
+        ) from exc
+    try:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        required = {"projects", "schema_migrations"}
+        missing = sorted(required - tables)
+        if missing:
+            raise OrchestrationError(
+                f"project-control schema incomplete; missing tables: {', '.join(missing)}"
+            )
+        active = conn.execute(
+            "SELECT human_id FROM projects WHERE is_active = 1 ORDER BY id ASC"
+        ).fetchone()
+        if active is None:
+            raise OrchestrationError(
+                "project-control has no active project after initialization"
+            )
+        if str(active[0]) != project_human_id:
+            raise OrchestrationError(
+                "project-control active project "
+                f"{active[0]!r} does not match repository identity {project_human_id!r}"
+            )
+    finally:
+        conn.close()
+
+    status = run_projectctl_status(repo_root, python_executable=python_executable)
+    ensure_single_active_project(status, expected_human_id=project_human_id)
 
 
 def _initialize_projectctl(
@@ -197,38 +328,31 @@ def _initialize_projectctl(
     project_name: str,
     python_executable: Path,
 ) -> None:
-    try:
-        run_projectctl(
-            repo_root,
-            [
-                "project",
-                "init",
-                "--human-id",
-                project_human_id,
-                "--name",
-                project_name,
-            ],
-            python_executable=python_executable,
-            require_zero=True,
-        )
-        return
-    except ProjectctlError:
-        control = repo_root / "project-control"
-        control.mkdir(parents=True, exist_ok=True)
-        db_path = control / "project.db"
-        if not db_path.is_file():
-            db_path.write_bytes(b"")
-        marker = control / ".projectctl-bootstrap"
-        marker.write_text(
-            json.dumps(
-                {
-                    "project_human_id": project_human_id,
-                    "project_name": project_name,
-                    "bootstrap": "projectos",
-                }
-            ),
-            encoding="utf-8",
-        )
+    db_path = _projectctl_db_path(repo_root)
+    run_projectctl(
+        repo_root,
+        ["init"],
+        python_executable=python_executable,
+        db_path=db_path,
+        require_zero=True,
+    )
+    _seed_inactive_projects_for_id(
+        repo_root,
+        project_human_id=project_human_id,
+        python_executable=python_executable,
+    )
+    run_projectctl(
+        repo_root,
+        ["project", "create", "--name", project_name.strip()],
+        python_executable=python_executable,
+        db_path=db_path,
+        require_zero=True,
+    )
+    validate_project_control_state(
+        repo_root,
+        project_human_id=project_human_id,
+        python_executable=python_executable,
+    )
 
 
 def bootstrap_project_repository(
@@ -253,7 +377,7 @@ def bootstrap_project_repository(
     try:
         if template_root.is_dir():
             for item in template_root.iterdir():
-                if item.name.startswith("."):
+                if item.name.startswith(".") and item.name != ".gitignore":
                     continue
                 dest = staging / item.name
                 if item.is_dir():
@@ -295,32 +419,37 @@ def bootstrap_project_repository(
         _run_git(staging, ["add", "-A"])
         _run_git(staging, ["commit", "-m", "chore: bootstrap delivery project"])
 
-        python_executable = _ensure_repo_venv(staging)
-        _initialize_projectctl(
-            staging,
-            project_human_id=project_human_id,
-            project_name=project_name,
-            python_executable=python_executable,
-        )
-        _run_git(staging, ["add", "-A"])
+        resolve_git_root(staging)
+        repo_dir.parent.mkdir(parents=True, exist_ok=True)
+        staging.rename(repo_dir)
+
+        python_executable = _create_repository_venv(repo_dir)
+        _install_delivery_project_package(repo_dir, python_executable)
+        try:
+            _initialize_projectctl(
+                repo_dir,
+                project_human_id=project_human_id,
+                project_name=project_name,
+                python_executable=python_executable,
+            )
+        except (ProjectctlError, OrchestrationError) as exc:
+            raise OrchestrationError(
+                f"Project creation failed during projectctl initialization: {exc}"
+            ) from exc
+        _run_git(repo_dir, ["add", "-A"])
         commit = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
-            cwd=staging,
+            cwd=repo_dir,
             capture_output=True,
             text=True,
             env=_git_env(),
         )
         if commit.returncode != 0:
-            _run_git(staging, ["commit", "-m", "chore: initialize project-control"])
-
-        resolve_git_root(staging)
-        repo_dir.parent.mkdir(parents=True, exist_ok=True)
-        staging.rename(repo_dir)
+            _run_git(repo_dir, ["commit", "-m", "chore: initialize project-control"])
         return repo_dir
     except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        if repo_dir.exists():
-            shutil.rmtree(repo_dir, ignore_errors=True)
+        _remove_repository_tree(staging)
+        _remove_repository_tree(repo_dir)
         raise
 
 
@@ -415,6 +544,33 @@ def _format_creation_reply(
     )
 
 
+def _remove_repository_tree(path: Path | None) -> None:
+    if path is None:
+        return
+    target = Path(path)
+    if not target.exists():
+        return
+
+    def _on_rm_error(func, p, exc_info):
+        import stat
+
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+        func(p)
+
+    shutil.rmtree(target, onerror=_on_rm_error)
+    if target.exists():
+        import time
+
+        for _ in range(10):
+            shutil.rmtree(target, onerror=_on_rm_error)
+            if not target.exists():
+                break
+            time.sleep(0.1)
+
+
 def create_project_from_sponsor_request(
     ctx: ServiceContext,
     request: ProjectCreationRequest,
@@ -457,28 +613,38 @@ def create_project_from_sponsor_request(
         project_name = derive_project_name(request.raw_request)
         defaults = load_project_defaults(defaults_path)
         defaults.projects_root.mkdir(parents=True, exist_ok=True)
+        conn.commit()
 
-        try:
-            repository_root = bootstrap_project_repository(
-                projects_root=defaults.projects_root,
-                template_root=defaults.delivery_template_root,
-                project_human_id=project_human_id,
-                project_name=project_name,
-                raw_request=request.raw_request,
-            )
-            register_project(
-                repository_root,
-                registry_path=ctx.registry_path,
-                projectctl_runner=projectctl_runner,
-            )
-        except Exception as exc:
+    repository_root: Path | None = None
+    try:
+        repository_root = bootstrap_project_repository(
+            projects_root=defaults.projects_root,
+            template_root=defaults.delivery_template_root,
+            project_human_id=project_human_id,
+            project_name=project_name,
+            raw_request=request.raw_request,
+        )
+        register_project(
+            repository_root,
+            registry_path=ctx.registry_path,
+            projectctl_runner=projectctl_runner,
+        )
+    except Exception as exc:
+        with connection(ctx.db_path) as conn:
             _release_project_id(conn, project_human_id)
-            phase = "bootstrap"
-            if isinstance(exc, RegistryConflictError):
-                phase = "registry"
-            raise OrchestrationError(f"Project creation failed during {phase}: {exc}") from exc
+            conn.commit()
+        _remove_repository_tree(repository_root)
+        phase = "bootstrap"
+        message = str(exc)
+        lowered = message.casefold()
+        if "projectctl initialization" in lowered:
+            phase = "projectctl initialization"
+        elif isinstance(exc, RegistryConflictError):
+            phase = "registry"
+        raise OrchestrationError(f"Project creation failed during {phase}: {exc}") from exc
 
-        require_safe_id(request.sponsor_user_id, label="sponsor_user_id")
+    require_safe_id(request.sponsor_user_id, label="sponsor_user_id")
+    with connection(ctx.db_path) as conn:
         set_session_project(
             conn,
             team_id=request.team_id,
