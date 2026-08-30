@@ -510,6 +510,9 @@ def handle_events_api_payload(
     return reply
 
 
+_TRANSPORT_ONLY_ENVELOPE_TYPES = frozenset({"hello", "disconnect"})
+
+
 def process_socket_envelope(
     ctx: ServiceContext,
     envelope: dict[str, Any],
@@ -522,16 +525,24 @@ def process_socket_envelope(
     kind = str(envelope.get("type") or "").strip()
     payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
     initialize_database(ctx.db_path)
-    duplicate = False
-    if envelope_id:
-        with connection(ctx.db_path) as conn:
-            if not claim_slack_envelope(conn, envelope_id, kind):
-                duplicate = True
-    ack = ack_envelope(envelope_id or "missing")
-    if duplicate:
+
+    if kind in _TRANSPORT_ONLY_ENVELOPE_TYPES:
+        ack = ack_envelope(envelope_id or f"missing-{kind}")
+        return {"ack": ack, "duplicate": False, "reply": None, "skipped": True}
+
+    if not envelope_id:
+        ack = ack_envelope("missing")
         return {"ack": ack, "duplicate": True, "reply": None}
 
+    from projectos.store import claim_slack_envelope
+
     if inline:
+        with connection(ctx.db_path) as conn:
+            duplicate = not claim_slack_envelope(conn, envelope_id, kind)
+            conn.commit()
+        ack = ack_envelope(envelope_id)
+        if duplicate:
+            return {"ack": ack, "duplicate": True, "reply": None}
         return _process_socket_envelope_inline(
             ctx,
             envelope_id=envelope_id,
@@ -542,22 +553,25 @@ def process_socket_envelope(
             bot_user_id=bot_user_id,
         )
 
-    from projectos.slack_ingress import (
-        WORK_TYPE_EVENTS_API,
-        WORK_TYPE_SLASH_COMMAND,
-        enqueue_socket_work,
-    )
+    from projectos.slack_ingress import persist_envelope_ingress_work
 
-    work_type = WORK_TYPE_SLASH_COMMAND if kind == "slash_commands" else WORK_TYPE_EVENTS_API
     with connection(ctx.db_path) as conn:
-        enqueue_socket_work(
+        work_id = persist_envelope_ingress_work(
             conn,
-            envelope_id=envelope_id or f"missing-{kind}",
-            work_type=work_type,
+            envelope_id=envelope_id,
+            envelope_kind=kind,
             payload=payload,
             bot_user_id=bot_user_id,
         )
+        duplicate = work_id is None
         conn.commit()
+    ack = ack_envelope(envelope_id)
+    if duplicate:
+        return {"ack": ack, "duplicate": True, "reply": None}
+
+    from projectos.slack_state import write_slack_state
+
+    write_slack_state({"envelope_received": True})
     return {"ack": ack, "duplicate": False, "reply": None, "enqueued": True}
 
 
@@ -684,14 +698,24 @@ def _run_websocket(
             return
         if not isinstance(envelope, dict):
             return
-        result = process_socket_envelope(ctx, envelope, http_post=http_post, bot_user_id=bot_user_id)
         try:
-            ws.send(json.dumps(result["ack"]))
-        except Exception:
-            pass
-        processed["n"] += 1
-        if max_envelopes is not None and processed["n"] >= max_envelopes:
-            ws.close()
+            result = process_socket_envelope(
+                ctx, envelope, http_post=http_post, bot_user_id=bot_user_id
+            )
+            try:
+                ws.send(json.dumps(result["ack"]))
+            except Exception:
+                pass
+            processed["n"] += 1
+            if max_envelopes is not None and processed["n"] >= max_envelopes:
+                ws.close()
+        except Exception as exc:  # noqa: BLE001 — transport must survive handler errors
+            write_slack_state(
+                {
+                    "status": "connected",
+                    "detail": f"Envelope handler error (transport continues): {_safe_detail(str(exc))}",
+                }
+            )
 
     def on_error(_ws, error):
         write_slack_state({"status": "error", "detail": _safe_detail(str(error))})

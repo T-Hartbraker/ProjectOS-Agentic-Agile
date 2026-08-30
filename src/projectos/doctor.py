@@ -336,9 +336,16 @@ def _add_slack_findings(report: DoctorReport) -> None:
         report.findings.append(DoctorFinding(level, "slack.bot_token", detail))
     else:
         report.findings.append(DoctorFinding("warn", "slack.bot_token", "missing"))
+    from projectos.operator import COMPONENT_SLACK, OperatorPaths, pid_is_alive, read_pid
+
+    paths = OperatorPaths()
+    adapter_pid = read_pid(paths, COMPONENT_SLACK)
+    adapter_alive = bool(adapter_pid and pid_is_alive(adapter_pid))
     info = public_connection(
         enabled=cfg.slack_enabled,
         tokens_ready=bool(tokens["app_token_present"] and tokens["bot_token_present"]),
+        adapter_pid=adapter_pid,
+        adapter_alive=adapter_alive if adapter_pid else None,
     )
     status = str(info.get("status") or "disconnected")
     updated = str(info.get("updated_at") or "").strip()

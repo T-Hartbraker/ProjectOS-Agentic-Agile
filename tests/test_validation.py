@@ -49,8 +49,13 @@ def test_valid_entry_passes(tmp_path: Path) -> None:
     assert result.git_root == repo.resolve()
 
 
-def test_missing_git_repository(tmp_path: Path) -> None:
-    repo = tmp_path / "not-a-git-repo"
+def test_missing_git_repository() -> None:
+    import tempfile
+    import uuid
+
+    base = Path(tempfile.gettempdir()) / f"projectos-val-{uuid.uuid4().hex}"
+    base.mkdir(parents=True, exist_ok=True)
+    repo = base / "not-a-git-repo"
     repo.mkdir()
     write_identity(repo, project_human_id="PRJ-003")
     with pytest.raises(GitRepositoryError, match="No Git repository"):

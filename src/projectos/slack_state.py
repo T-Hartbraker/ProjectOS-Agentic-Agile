@@ -37,6 +37,10 @@ def _empty() -> dict[str, Any]:
         "workspace_name": None,
         "team_id": None,
         "updated_at": None,
+        "last_connected_at": None,
+        "last_envelope_at": None,
+        "reconnect_attempt": None,
+        "last_disconnect_reason": None,
         "seen_envelopes": [],
     }
 
@@ -58,6 +62,11 @@ def read_slack_state(path: Path | None = None) -> dict[str, Any]:
     state["workspace_name"] = raw.get("workspace_name") or None
     state["team_id"] = raw.get("team_id") or None
     state["updated_at"] = raw.get("updated_at")
+    state["last_connected_at"] = raw.get("last_connected_at")
+    state["last_envelope_at"] = raw.get("last_envelope_at")
+    reconnect = raw.get("reconnect_attempt")
+    state["reconnect_attempt"] = int(reconnect) if reconnect is not None else None
+    state["last_disconnect_reason"] = raw.get("last_disconnect_reason") or None
     envelopes = raw.get("seen_envelopes") or []
     if isinstance(envelopes, list):
         state["seen_envelopes"] = [str(item) for item in envelopes][-MAX_ENVELOPES:]
@@ -69,11 +78,25 @@ def write_slack_state(updates: dict[str, Any], *, path: Path | None = None) -> d
     current = read_slack_state(target)
     if "seen_envelopes" in updates:
         current["seen_envelopes"] = list(updates["seen_envelopes"])[-MAX_ENVELOPES:]
-    for key in ("status", "detail", "workspace_name", "team_id"):
+    for key in (
+        "status",
+        "detail",
+        "workspace_name",
+        "team_id",
+        "last_connected_at",
+        "last_envelope_at",
+        "reconnect_attempt",
+        "last_disconnect_reason",
+    ):
         if key in updates:
             current[key] = updates[key]
     if current["status"] not in VALID_STATUSES:
         current["status"] = "error"
+    if updates.get("status") == "connected":
+        current["last_connected_at"] = _now()
+        current["reconnect_attempt"] = 0
+    if "envelope_received" in updates and updates["envelope_received"]:
+        current["last_envelope_at"] = _now()
     current["updated_at"] = _now()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(current, indent=2), encoding="utf-8")

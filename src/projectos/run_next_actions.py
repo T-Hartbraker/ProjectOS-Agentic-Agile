@@ -365,7 +365,8 @@ def reconcile_run_next_actions(
             complete_run_next_action(conn, action_id=str(row["action_id"]))
             reconciled.append(str(row["action_id"]))
 
-    if has_durable_next_action(conn, run_id=run_id, project_id=project_id):
+    live = list_active_next_actions(conn, run_id=run_id)
+    if live:
         return reconciled
 
     ready_jobs = list_jobs_for_run(conn, run_id, statuses=_EXECUTABLE_JOB)

@@ -321,7 +321,9 @@ def test_completed_job_not_pending_next_action(tmp_path: Path) -> None:
         mark_succeeded(conn, arch.id, output_ref=None, candidate_git_sha="sha1")
         reconcile_run_next_actions(conn, run_id=run.run_id, project_id="PRJ-007")
         live = list_active_next_actions(conn, run_id=run.run_id)
-        assert all(a.get("orchestration_job_id") != arch.id for a in live) or live == []
+        assert all(
+            int(a.get("orchestration_job_id") or 0) != arch.id for a in live
+        )
 
 
 def test_dashboard_health_distinguishes_connected_and_process_dead(tmp_path: Path, monkeypatch) -> None:
@@ -497,3 +499,108 @@ def test_restart_reconstructs_executable_work(tmp_path: Path) -> None:
         assert has_durable_next_action(
             conn, run_id=run.run_id, project_id="PRJ-007"
         )
+
+
+def test_pending_ingress_survives_daemon_restart_once(tmp_path: Path, monkeypatch) -> None:
+    ctx = _ctx(tmp_path)
+    envelope = {
+        "envelope_id": "env-restart-once",
+        "type": "events_api",
+        "payload": {
+            "team_id": "T1",
+            "event_id": "Ev-restart",
+            "event": {
+                "type": "message",
+                "channel": "C007",
+                "channel_type": "group",
+                "ts": "201.0",
+                "user": "U1",
+                "text": "/projectos help",
+            },
+        },
+    }
+    calls: list[int] = []
+
+    def handler(*args, **kwargs):
+        calls.append(1)
+        return {"text": "help", "response_type": "ephemeral"}
+
+    monkeypatch.setattr("projectos.slack_ingress.handle_events_api_payload", handler)
+    process_socket_envelope(ctx, envelope)
+    batch1 = process_slack_ingress_batch(ctx, claimed_by="daemon-a")
+    assert batch1["processed"] == 1
+    batch2 = process_slack_ingress_batch(ctx, claimed_by="daemon-b")
+    assert batch2["processed"] == 0
+    assert len(calls) == 1
+
+
+def test_duplicate_new_project_envelope_is_idempotent(tmp_path: Path, monkeypatch) -> None:
+    from projectos.slack_socket import handle_events_api_payload
+
+    ctx = _ctx(tmp_path)
+    created: list[str] = []
+
+    def fake_create(ctx_, request, **kwargs):
+        created.append(request.dedup_key or "missing")
+        from projectos.project_creation import ProjectCreationResult
+
+        return ProjectCreationResult(
+            project_human_id="PRJ-008",
+            repository_root=tmp_path / "p8",
+            handoff_id="HND-1",
+            run_id="RUN-NEW",
+            reply_text="New project initiated PRJ-008",
+            idempotent_replay=False,
+        )
+
+    monkeypatch.setattr(
+        "projectos.project_creation.create_project_from_sponsor_request",
+        fake_create,
+    )
+    payload = {
+        "team_id": "T1",
+        "event_id": "Ev-dup",
+        "event": {
+            "type": "app_mention",
+            "channel": "C007",
+            "ts": "300.0",
+            "user": "U1",
+            "text": "<@UBOT> Start a new project to build a widget.",
+        },
+    }
+    handle_events_api_payload(ctx, payload, bot_user_id="UBOT")
+    handle_events_api_payload(ctx, payload, bot_user_id="UBOT")
+    assert len(created) == 1
+
+
+def test_slack_state_persists_reconnect_metadata(tmp_path: Path, monkeypatch) -> None:
+    state_path = tmp_path / "slack_socket.json"
+    monkeypatch.setattr("projectos.slack_state.STATE_PATH", state_path)
+    write_slack_state(
+        {
+            "status": "reconnecting",
+            "reconnect_attempt": 3,
+            "last_disconnect_reason": "code=1006 reason=",
+        }
+    )
+    from projectos.slack_state import read_slack_state
+
+    state = read_slack_state(state_path)
+    assert state["reconnect_attempt"] == 3
+    assert "1006" in str(state["last_disconnect_reason"])
+
+
+def test_intentional_slack_stop_sets_shutdown_flag(tmp_path: Path, monkeypatch) -> None:
+    from projectos.slack_adapter import (
+        _SHUTDOWN_FLAG,
+        clear_slack_adapter_shutdown,
+        request_slack_adapter_shutdown,
+    )
+
+    monkeypatch.setattr("projectos.slack_adapter._SHUTDOWN_FLAG", tmp_path / "shutdown.flag")
+    from projectos.slack_adapter import _SHUTDOWN_FLAG as flag
+
+    clear_slack_adapter_shutdown()
+    assert not flag.is_file()
+    request_slack_adapter_shutdown()
+    assert flag.is_file()

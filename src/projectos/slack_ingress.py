@@ -25,9 +25,62 @@ WORK_STATUS_PENDING = "pending"
 WORK_STATUS_CLAIMED = "claimed"
 WORK_STATUS_SUCCEEDED = "succeeded"
 WORK_STATUS_FAILED = "failed"
+WORK_STATUS_QUARANTINED = "quarantined"
 
 WORK_TYPE_EVENTS_API = "events_api"
 WORK_TYPE_SLASH_COMMAND = "slash_commands"
+
+
+def persist_envelope_ingress_work(
+    conn: sqlite3.Connection,
+    *,
+    envelope_id: str,
+    envelope_kind: str,
+    payload: dict[str, Any],
+    bot_user_id: str | None = None,
+) -> str | None:
+    """Atomically claim envelope and enqueue ingress work. Returns work_id or None if duplicate."""
+    from projectos.store import claim_slack_envelope
+
+    envelope_id = str(envelope_id or "").strip()
+    if not envelope_id:
+        raise OrchestrationError("Slack ingress requires envelope_id")
+    if not claim_slack_envelope(conn, envelope_id, envelope_kind):
+        return None
+    work_type = (
+        WORK_TYPE_SLASH_COMMAND if envelope_kind == "slash_commands" else WORK_TYPE_EVENTS_API
+    )
+    return enqueue_socket_work(
+        conn,
+        envelope_id=envelope_id,
+        work_type=work_type,
+        payload=payload,
+        bot_user_id=bot_user_id,
+    )
+
+
+def recover_stale_ingress_work(conn: sqlite3.Connection) -> int:
+    """Requeue abandoned claims and recoverable failures."""
+    ensure_slack_ingress_table(conn)
+    conn.execute(
+        f"""
+        UPDATE slack_ingress_work
+        SET status = ?, claimed_by = NULL, claim_expires_at = NULL, updated_at = ?
+        WHERE status = ?
+          AND claim_expires_at IS NOT NULL
+          AND {_claim_expiry_sql()}
+        """,
+        (WORK_STATUS_PENDING, utc_now_iso(), WORK_STATUS_CLAIMED),
+    )
+    cur = conn.execute(
+        """
+        UPDATE slack_ingress_work
+        SET status = ?, claimed_by = NULL, claim_expires_at = NULL, updated_at = ?
+        WHERE status = ? AND attempts < 10
+        """,
+        (WORK_STATUS_PENDING, utc_now_iso(), WORK_STATUS_FAILED),
+    )
+    return int(cur.rowcount)
 
 
 def _new_work_id() -> str:
@@ -161,22 +214,23 @@ def _mark_work(
     work_id: str,
     status: str,
     error: str | None = None,
+    increment_attempt: bool = True,
 ) -> None:
     conn.execute(
         """
         UPDATE slack_ingress_work
         SET status = ?,
             last_error = ?,
-            attempts = attempts + CASE WHEN ? IN (?, ?) THEN 1 ELSE 0 END,
+            attempts = attempts + CASE WHEN ? THEN 1 ELSE 0 END,
+            claimed_by = NULL,
+            claim_expires_at = NULL,
             updated_at = ?
         WHERE work_id = ?
         """,
         (
             status,
             (error or "")[:500] or None,
-            status,
-            WORK_STATUS_FAILED,
-            WORK_STATUS_SUCCEEDED,
+            1 if increment_attempt else 0,
             utc_now_iso(),
             work_id,
         ),
@@ -284,6 +338,7 @@ def process_slack_ingress_batch(
     processed = 0
     failed = 0
     with connection(ctx.db_path) as conn:
+        recover_stale_ingress_work(conn)
         claimed = claim_pending_ingress_work(conn, claimed_by=claimed_by, limit=limit)
         conn.commit()
 
@@ -292,12 +347,31 @@ def process_slack_ingress_batch(
         try:
             _execute_work_item(ctx, work, http_post=http_post)
             with connection(ctx.db_path) as conn:
-                _mark_work(conn, work_id=work_id, status=WORK_STATUS_SUCCEEDED)
+                _mark_work(
+                    conn,
+                    work_id=work_id,
+                    status=WORK_STATUS_SUCCEEDED,
+                    increment_attempt=False,
+                )
                 conn.commit()
             processed += 1
         except Exception as exc:  # noqa: BLE001
             with connection(ctx.db_path) as conn:
-                _mark_work(conn, work_id=work_id, status=WORK_STATUS_FAILED, error=str(exc))
+                row = conn.execute(
+                    "SELECT attempts FROM slack_ingress_work WHERE work_id = ?",
+                    (work_id,),
+                ).fetchone()
+                attempts = int(row["attempts"]) + 1 if row else 1
+                status = (
+                    WORK_STATUS_PENDING if attempts < 10 else WORK_STATUS_FAILED
+                )
+                _mark_work(
+                    conn,
+                    work_id=work_id,
+                    status=status,
+                    error=str(exc),
+                    increment_attempt=status == WORK_STATUS_FAILED,
+                )
                 conn.commit()
             failed += 1
 

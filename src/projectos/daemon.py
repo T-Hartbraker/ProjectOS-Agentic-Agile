@@ -15,6 +15,7 @@ from projectos.dispatch import run_dispatch
 from projectos.errors import OrchestrationError
 from projectos.migrate import initialize_database
 from projectos.paths import DEFAULT_DB_PATH, DEFAULT_REGISTRY_PATH, STATE_DIR
+from projectos.process_util import kill_process_tree, pid_is_alive as _process_pid_alive
 from projectos.recover import run_recovery
 from projectos.schedule import evaluate_due
 from projectos.store import utc_now_iso
@@ -78,27 +79,7 @@ class DaemonLock:
 
 
 def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if sys.platform == "win32":
-        try:
-            import ctypes
-
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, 0, pid
-            )
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
-                return True
-            return False
-        except Exception:
-            return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return _process_pid_alive(pid)
 
 
 def _read_lock_pid(lock_path: str | Path | None) -> int | None:
@@ -205,6 +186,7 @@ def run_daemon(
 
                 dispatch_event_outbox(path)
                 from projectos.slack_ingress import process_slack_ingress_batch
+                from projectos.services.context import ServiceContext
 
                 process_slack_ingress_batch(
                     ServiceContext(db_path=path, registry_path=reg),
@@ -261,22 +243,28 @@ def run_daemon(
 def stop_daemon(db_path: Path | str | None = None) -> int:
     """Best-effort stop via lock/PID (Windows-appropriate)."""
     status = get_daemon_status(db_path)
-    if status.pid and _pid_alive(status.pid):
-        if sys.platform == "win32":
-            os.system(f"taskkill /PID {status.pid} /F >NUL 2>&1")
-        else:
-            try:
-                os.kill(status.pid, 15)
-            except OSError:
-                pass
-    lock = STATE_DIR / "projectos.daemon.lock"
-    if lock.exists():
+    path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    lock_path = Path(status.lock_path) if status.lock_path else STATE_DIR / "projectos.daemon.lock"
+    candidates: list[int] = []
+    if status.pid:
+        candidates.append(int(status.pid))
+    lock_pid = _read_lock_pid(lock_path)
+    if lock_pid:
+        candidates.append(lock_pid)
+    pid_file = STATE_DIR / "run" / "daemon.pid"
+    if pid_file.is_file():
         try:
-            lock.unlink()
+            candidates.append(int(pid_file.read_text(encoding="utf-8").strip()))
+        except ValueError:
+            pass
+    for pid in dict.fromkeys(candidates):
+        kill_process_tree(pid)
+    if lock_path.exists():
+        try:
+            lock_path.unlink()
         except OSError:
             pass
-    path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
     initialize_database(path)
     with connection(path) as conn:
-        _persist_daemon(conn, status="stopped", pid=None)
+        _persist_daemon(conn, status="stopped", pid=None, lock_path=None)
     return 0

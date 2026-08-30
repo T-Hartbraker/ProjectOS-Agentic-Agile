@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from projectos import __version__
 from projectos.daemon import get_daemon_status, stop_daemon
 from projectos.dashboard_build import ensure_dashboard_built
 from projectos.paths import LOGS_DIR, PROJECTOS_ROOT, STATE_DIR, dashboard_is_built
+from projectos.process_util import kill_process_tree, pid_is_alive as _pid_alive_util
 from projectos.runtime_deps import ensure_http_deps
 from projectos.services.context import ServiceContext
 
@@ -71,24 +73,112 @@ def load_operator_config(path: Path | None = None) -> OperatorConfig:
 
 
 def pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if sys.platform == "win32":
-        try:
-            import ctypes
+    return _pid_alive_util(pid)
 
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, 0, pid)
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
-                return True
-            return False
-        except Exception:
-            return False
+
+def _runtime_generation_path(paths: OperatorPaths) -> Path:
+    return paths.run_dir / "runtime.json"
+
+
+def _current_source_head() -> str:
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(PROJECTOS_ROOT),
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            .strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def write_runtime_generation(paths: OperatorPaths, *, components: dict[str, int]) -> dict[str, Any]:
+    from projectos.store import utc_now_iso
+
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generation_id": str(uuid.uuid4()),
+        "started_at": utc_now_iso(),
+        "source_head": _current_source_head(),
+        "python_executable": sys.executable,
+        "components": components,
+    }
+    _runtime_generation_path(paths).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def read_runtime_generation(paths: OperatorPaths) -> dict[str, Any] | None:
+    target = _runtime_generation_path(paths)
+    if not target.is_file():
+        return None
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def runtime_generation_is_stale(paths: OperatorPaths) -> tuple[bool, str]:
+    recorded = read_runtime_generation(paths)
+    if recorded is None:
+        return False, ""
+    current_head = _current_source_head()
+    recorded_head = str(recorded.get("source_head") or "")
+    if recorded_head and current_head != "unknown" and recorded_head != current_head:
+        return True, f"runtime source_head {recorded_head[:12]} != current {current_head[:12]}"
+    for name in (COMPONENT_API, COMPONENT_DAEMON, COMPONENT_SLACK):
+        pid = read_pid(paths, name)
+        if pid and pid_is_alive(pid):
+            gen_components = recorded.get("components") or {}
+            if int(gen_components.get(name) or 0) != pid:
+                return True, f"{name} pid {pid} not from current runtime generation"
+    return False, ""
+
+
+def ensure_runtime_fresh(ctx: ServiceContext, *, paths: OperatorPaths) -> None:
+    """Stop stale operator processes when source generation changed."""
+    stale, reason = runtime_generation_is_stale(paths)
+    if not stale:
+        return
+    stop_operator(ctx, paths=paths)
+    if reason:
+        write_error(paths, COMPONENT_DAEMON, f"Replaced stale runtime generation ({reason})")
+
+
+def _slack_respawn_state_path(paths: OperatorPaths) -> Path:
+    return paths.run_dir / "slack_respawn.json"
+
+
+def _slack_respawn_backoff_seconds(paths: OperatorPaths) -> float:
+    target = _slack_respawn_state_path(paths)
+    if not target.is_file():
+        return 0.0
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+        return float(raw.get("backoff_seconds") or 0.0)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return 0.0
+
+
+def _record_slack_respawn(paths: OperatorPaths, *, success: bool) -> None:
+    from projectos.store import utc_now_iso
+
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    prior = _slack_respawn_backoff_seconds(paths)
+    backoff = 1.0 if success else min(max(prior, 1.0) * 2.0, 120.0)
+    _slack_respawn_state_path(paths).write_text(
+        json.dumps(
+            {
+                "last_respawn_at": utc_now_iso(),
+                "backoff_seconds": backoff,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _pid_file(paths: OperatorPaths, name: str) -> Path:
@@ -434,11 +524,32 @@ def maybe_respawn_slack_adapter(
     cfg = config or load_operator_config(paths.config_path)
     if not cfg.slack_enabled:
         return False
+    from projectos.slack_tokens import token_report
+
+    tokens = token_report()
+    if not (tokens.get("app_token_present") and tokens.get("bot_token_present")):
+        return False
     pid = read_pid(paths, COMPONENT_SLACK)
     if pid and pid_is_alive(pid):
+        _record_slack_respawn(paths, success=True)
         return False
+    backoff = _slack_respawn_backoff_seconds(paths)
+    if backoff > 0:
+        state_path = _slack_respawn_state_path(paths)
+        try:
+            raw = json.loads(state_path.read_text(encoding="utf-8"))
+            last = str(raw.get("last_respawn_at") or "")
+            if last:
+                from datetime import datetime, timezone
+
+                then = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                elapsed = (datetime.now(timezone.utc) - then).total_seconds()
+                if elapsed < backoff:
+                    return False
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
     python = sys.executable
-    spawn_logged(
+    new_pid = spawn_logged(
         [
             python,
             "-m",
@@ -461,6 +572,12 @@ def maybe_respawn_slack_adapter(
             "detail": "Slack adapter respawned by operator supervision",
         }
     )
+    _record_slack_respawn(paths, success=False)
+    gen = read_runtime_generation(paths)
+    if gen is not None:
+        components = dict(gen.get("components") or {})
+        components[COMPONENT_SLACK] = new_pid
+        write_runtime_generation(paths, components=components)
     return True
 
 
@@ -526,11 +643,23 @@ def spawn_logged(
 def stop_component(
     name: str, *, paths: OperatorPaths, ctx: ServiceContext | None = None
 ) -> None:
+    if name == COMPONENT_SLACK:
+        from projectos.slack_adapter import request_slack_adapter_shutdown
+
+        request_slack_adapter_shutdown()
+        from projectos.slack_state import write_slack_state
+
+        write_slack_state(
+            {
+                "status": "disconnected",
+                "detail": "Slack adapter stopped by operator.",
+            }
+        )
     if name == COMPONENT_DAEMON and ctx is not None:
         stop_daemon(ctx.db_path)
     pid = read_pid(paths, name)
     if pid:
-        _kill_pid(pid)
+        kill_process_tree(pid)
     pid_file = _pid_file(paths, name)
     if pid_file.exists():
         pid_file.unlink()
@@ -549,6 +678,7 @@ def start_operator(
 ) -> dict[str, Any]:
     paths = paths or OperatorPaths()
     cfg = config or load_operator_config(paths.config_path)
+    ensure_runtime_fresh(ctx, paths=paths)
     python = sys.executable
     started: dict[str, int] = {}
     if start_api or (start_slack is not False and cfg.slack_enabled):
@@ -653,6 +783,8 @@ def start_operator(
                 paths=paths,
             )
             started[COMPONENT_SLACK] = pid
+    if started:
+        write_runtime_generation(paths, components=started)
     snapshot = operator_health(ctx, paths=paths, config=cfg)
     if wait:
         try:

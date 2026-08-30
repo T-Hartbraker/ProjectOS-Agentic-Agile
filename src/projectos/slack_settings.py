@@ -35,7 +35,17 @@ def read_slack_settings(*, db_path: Path | str | None = None) -> dict[str, Any]:
     cfg = load_operator_config()
     tokens = token_report(refresh=True)
     tokens_ready = bool(tokens.get("tokens_ready"))
-    connection_info = public_connection(enabled=cfg.slack_enabled, tokens_ready=tokens_ready)
+    from projectos.operator import OperatorPaths, read_pid, pid_is_alive, COMPONENT_SLACK
+
+    paths = OperatorPaths()
+    pid = read_pid(paths, COMPONENT_SLACK)
+    alive = bool(pid and pid_is_alive(pid))
+    connection_info = public_connection(
+        enabled=cfg.slack_enabled,
+        tokens_ready=tokens_ready,
+        adapter_pid=pid,
+        adapter_alive=alive if pid else None,
+    )
     path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
     interface_channels: list[dict[str, Any]] = []
     bound_channels: list[dict[str, Any]] = []

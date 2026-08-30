@@ -653,16 +653,13 @@ def run_once(
 
                 event_ctx = lookup_event_context_for_job(conn, job_id)
                 if event_ctx is not None:
-                    try:
-                        handle_release_blocked_job(
-                            conn,
-                            event_ctx=event_ctx,
-                            job=final,
-                            release_eval=release_eval,
-                            repository_root=job_repo,
-                        )
-                    except Exception:
-                        pass
+                    handle_release_blocked_job(
+                        conn,
+                        event_ctx=event_ctx,
+                        job=final,
+                        release_eval=release_eval,
+                        repository_root=job_repo,
+                    )
                 return WorkerResult(
                     status="blocked",
                     job_human_id=job_human,

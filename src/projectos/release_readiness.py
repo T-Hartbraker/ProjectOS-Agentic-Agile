@@ -34,11 +34,6 @@ DEFAULT_RELEASE_NAME = "ITER-002 Phase 2 increment"
 DEFAULT_RELEASE_VERSION = "0.2.0"
 ITERATION_SYNC_TARGET = "release_candidate"
 
-ACCEPTED_STORY_SHAS = {
-    "US-007": "b69ac0720f43d4d0bec3427a098d80938959ae2d",
-    "US-008": "8f45ef82936abb82f00b5d2ec25ef8b2d07638e1",
-}
-
 _ITERATION_PROGRESSION = (
     "planned",
     "in_delivery",
