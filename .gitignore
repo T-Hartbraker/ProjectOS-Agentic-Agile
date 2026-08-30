@@ -18,6 +18,7 @@ build/
 # Local operator/runtime configuration (not product defaults)
 config/projects.json
 config/operator.json
+config/project_defaults.json
 tmp_live_forensics.py
 
 # Durable local orchestration runtime (keep directory placeholders only)
