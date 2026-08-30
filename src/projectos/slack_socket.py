@@ -30,6 +30,8 @@ from projectos.slack_thread_context import (
 from projectos.slack_chatgpt import try_handle_chatgpt_event
 from projectos.slack_event_idempotency import slack_event_dedup_keys
 from projectos.slack_commands import run_command
+from projectos.slack_intent import SlackIntent, classify_projectos_intent
+from projectos.project_creation import handle_new_project_sponsor_request
 from projectos.slack_replies import (
     HELP_TEXT,
     UNAUTHORIZED_CHANNEL_TEXT,
@@ -200,12 +202,40 @@ def handle_projectos_request(
     thread_root_ts: str | None = None,
     user_id: str | None,
     parse_fn=parse_slash_text,
+    source_message_ts: str | None = None,
+    event_id: str = "",
+    dedup_key: str | None = None,
+    projectctl_runner=None,
+    project_defaults_path=None,
 ) -> dict[str, Any]:
+    intent = classify_projectos_intent(text)
+    if intent == SlackIntent.NEW_PROJECT:
+        if not user_id:
+            return {
+                "text": "Could not identify your Slack user for new project creation.",
+                "response_type": "ephemeral",
+            }
+        session_thread_ts = str(thread_root_ts or thread_ts or "").strip()
+        return handle_new_project_sponsor_request(
+            ctx,
+            raw_text=text,
+            team_id=team_id or "",
+            channel_id=channel_id,
+            thread_ts=session_thread_ts,
+            sponsor_user_id=user_id,
+            source_message_ts=str(source_message_ts or thread_ts or "").strip(),
+            event_id=event_id,
+            dedup_key=dedup_key,
+            projectctl_runner=projectctl_runner,
+            defaults_path=project_defaults_path,
+        )
+
     if project_override_attempt(text):
         return {
             "text": "Use `/projectos use PRJ-003` or `/projectos PRJ-003 status` to select a project.",
             "response_type": "ephemeral",
         }
+
     parsed = parse_fn(text)
     verb = str(parsed.get("command") or "summary").lower()
     explicit = parsed.get("project_human_id")
@@ -451,6 +481,8 @@ def handle_events_api_payload(
         text = _MENTION_RE.sub("", text).strip()
 
     thread_ts = thread_ts_for_event(event)
+    dedup_key = slack_event_dedup_keys(payload, event)
+    primary_dedup_key = dedup_key[0] if dedup_key else None
     reply = handle_projectos_request(
         ctx,
         text=text,
@@ -460,6 +492,9 @@ def handle_events_api_payload(
         thread_root_ts=thread_root,
         user_id=str(event.get("user") or "").strip() or None,
         parse_fn=parse_conversational_text,
+        source_message_ts=str(event.get("ts") or "").strip(),
+        event_id=str(payload.get("event_id") or "").strip(),
+        dedup_key=primary_dedup_key,
     )
     if reply is not None and thread_root:
         with connection(ctx.db_path) as conn:

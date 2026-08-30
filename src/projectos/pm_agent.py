@@ -277,11 +277,13 @@ def accept_sponsor_handoff(
     thread_ts: str,
     sponsor_user_id: str,
     advisor_text: str = "",
+    request_type_override: str | None = None,
+    explicit_new_project: bool = False,
 ) -> PmHandoffResult:
     existing = get_latest_thread_handoff(
         conn, team_id=team_id, channel_id=channel_id, thread_ts=thread_ts
     )
-    request_type = _request_type_for_handoff(handoff)
+    request_type = request_type_override or _request_type_for_handoff(handoff)
     active_run = None
     if existing and existing.status == "ACCEPTED_BY_PM" and existing.run_id:
         active_run = get_execution_run(conn, existing.run_id)
@@ -326,9 +328,12 @@ def accept_sponsor_handoff(
         constraints_json=handoff.constraints if handoff.constraints.startswith("{") else "{}",
         acceptance_intent=handoff.acceptance_intent,
         exclusions=handoff.exclusions,
-        desired_outputs_json=classify_request(
-            text=handoff.objective, fallback_objective=handoff.objective
-        ).desired_outputs_json(),
+        desired_outputs_json=(
+            handoff.desired_outputs_json
+            or classify_request(
+                text=handoff.objective, fallback_objective=handoff.objective
+            ).desired_outputs_json()
+        ),
         conversation_summary=handoff.source_conversation_summary,
     )
     run = create_execution_run(
@@ -422,6 +427,7 @@ def accept_sponsor_handoff(
         projectos_text=projectos_text,
         projectos_blocks=blocks,
         request_type=request_type,
+        explicit_new_project=explicit_new_project,
     )
 
 
@@ -944,6 +950,7 @@ def _orchestrate_work_handoff(
     projectos_text: str,
     projectos_blocks: list,
     request_type: str,
+    explicit_new_project: bool = False,
 ) -> PmHandoffResult:
     phases = [("Intake validation", "active"), ("Governed preview", "pending"), ("Execution", "pending")]
     _emit_plan(
@@ -990,7 +997,9 @@ def _orchestrate_work_handoff(
     if is_work_mutation(proposal.action_type):
         from projectos.slack_chatgpt import _generate_and_persist_preview
 
-        preview_text = _generate_and_persist_preview(ctx, conn, proposal)
+        preview_text = _generate_and_persist_preview(
+            ctx, conn, proposal, explicit_new_project=explicit_new_project
+        )
         pause_run_for_sponsor_decision(
             conn,
             event_ctx=thread,

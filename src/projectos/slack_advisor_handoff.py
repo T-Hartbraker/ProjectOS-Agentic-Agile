@@ -45,6 +45,7 @@ class HandoffRequest:
     acceptance_intent: str
     exclusions: str
     source_conversation_summary: str
+    desired_outputs_json: str = ""
 
     def to_instruction(self) -> str:
         lines = [self.objective.strip()]

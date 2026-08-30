@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "projects_root": "/absolute/path/to/delivery/projects/parent",
+  "delivery_template_root": null
+}

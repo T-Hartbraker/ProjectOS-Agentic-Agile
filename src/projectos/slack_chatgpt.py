@@ -59,6 +59,8 @@ from projectos.pm_capabilities import ensure_pm_run_for_approved_proposal, execu
 from projectos.sponsor_action_audit import record_sponsor_action_audit
 from projectos.sponsor_action_intent import detect_sponsor_action_intent
 from projectos.sponsor_query import SponsorQueryService
+from projectos.slack_intent import SlackIntent, classify_projectos_intent
+from projectos.project_creation import handle_new_project_sponsor_request
 from projectos.slack_advisor_handoff import (
     looks_like_handoff_trigger,
     parse_handoff_request,
@@ -383,9 +385,13 @@ def _work_intake_kwargs(proposal) -> dict[str, str]:
     }
 
 
-def preview_work_proposal(ctx: ServiceContext, proposal) -> tuple[IntakeResult, str]:
+def preview_work_proposal(
+    ctx: ServiceContext, proposal, *, explicit_new_project: bool = False
+) -> tuple[IntakeResult, str]:
     kwargs = _work_intake_kwargs(proposal)
-    result = IntakeService(ctx).preview(proposal.project_human_id, **kwargs)
+    result = IntakeService(ctx).preview(
+        proposal.project_human_id, **kwargs, explicit_new_project=explicit_new_project
+    )
     text = format_work_intake_preview(result, proposal)
     return result, text
 
@@ -397,8 +403,12 @@ def execute_work_proposal(ctx: ServiceContext, proposal) -> tuple[IntakeResult, 
     return result, text
 
 
-def _generate_and_persist_preview(ctx: ServiceContext, conn, proposal) -> str:
-    _, preview_text = preview_work_proposal(ctx, proposal)
+def _generate_and_persist_preview(
+    ctx: ServiceContext, conn, proposal, *, explicit_new_project: bool = False
+) -> str:
+    _, preview_text = preview_work_proposal(
+        ctx, proposal, explicit_new_project=explicit_new_project
+    )
     updated = save_proposal_preview(
         conn,
         proposal_id=proposal.proposal_id,
@@ -869,6 +879,26 @@ def handle_chatgpt_slack_message(
             text=cleaned,
         ):
             return None
+
+        if classify_projectos_intent(cleaned) == SlackIntent.NEW_PROJECT:
+            created = handle_new_project_sponsor_request(
+                ctx,
+                raw_text=cleaned,
+                team_id=team_id or "",
+                channel_id=channel_id,
+                thread_ts=thread_key,
+                sponsor_user_id=user_id,
+                source_message_ts=str(message_ts or thread_key),
+            )
+            upsert_chatgpt_thread(
+                conn,
+                team_id=team_id or "",
+                channel_id=channel_id,
+                thread_ts=thread_key,
+                sponsor_user_id=user_id,
+                active=True,
+            )
+            return single_advisor_response(str(created.get("text") or ""))
 
         project_id, resolve_error = _resolve_authoritative_project(
             conn,

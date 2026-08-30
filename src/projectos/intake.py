@@ -122,6 +122,7 @@ def assess_work_request(
     objective: str,
     acceptance: str,
     sponsor_authority: str | None = None,
+    explicit_new_project: bool = False,
 ) -> tuple[list[Assumption], list[DecisionRequest]]:
     """Classify gaps. Does not invent a job graph or health score."""
     assumptions = list(_pm_assumptions())
@@ -161,7 +162,7 @@ def assess_work_request(
                 "Sponsor must provide testable acceptance (what must be true when this is done).",
             )
         )
-    if any(marker in blob for marker in _NEW_VENTURE_MARKERS):
+    if any(marker in blob for marker in _NEW_VENTURE_MARKERS) and not explicit_new_project:
         decisions.append(
             DecisionRequest(
                 "scope_new_venture",
@@ -281,6 +282,7 @@ class IntakeService:
         acceptance: str,
         iteration_human_id: str | None = None,
         sponsor_authority: str | None = None,
+        explicit_new_project: bool = False,
         cursor_runner=None,
         projectctl_runner=None,
     ) -> IntakeResult:
@@ -292,6 +294,7 @@ class IntakeService:
             acceptance=acceptance,
             iteration_human_id=iteration_human_id,
             sponsor_authority=sponsor_authority,
+            explicit_new_project=explicit_new_project,
             cursor_runner=cursor_runner,
             projectctl_runner=projectctl_runner,
         )
@@ -319,6 +322,7 @@ class IntakeService:
         acceptance: str,
         iteration_human_id: str | None = None,
         sponsor_authority: str | None = None,
+        explicit_new_project: bool = False,
         cursor_runner=None,
         projectctl_runner=None,
     ) -> IntakeResult:
@@ -330,6 +334,7 @@ class IntakeService:
             acceptance=acceptance,
             iteration_human_id=iteration_human_id,
             sponsor_authority=sponsor_authority,
+            explicit_new_project=explicit_new_project,
             cursor_runner=cursor_runner,
             projectctl_runner=projectctl_runner,
         )
@@ -344,6 +349,7 @@ class IntakeService:
         acceptance: str,
         iteration_human_id: str | None,
         sponsor_authority: str | None,
+        explicit_new_project: bool,
         cursor_runner,
         projectctl_runner,
     ) -> IntakeResult:
@@ -353,6 +359,7 @@ class IntakeService:
             objective=objective,
             acceptance=acceptance,
             sponsor_authority=sponsor_authority,
+            explicit_new_project=explicit_new_project,
         )
         work_request = {
             "business_request": business_request.strip(),
