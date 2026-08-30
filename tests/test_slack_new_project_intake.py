@@ -257,6 +257,8 @@ def test_direct_projectos_new_project_request_creates_project_and_starts_run(
     constraints = json.loads(handoff_constraints["constraints_json"])
     assert constraints.get("execution_authorized") is True
     assert constraints.get("authority_source") == "explicit_new_project"
+    assert constraints.get("authority_ingress") == "slack_new_project"
+    assert constraints.get("sponsor_user_id") == "U1"
     assert len(next_actions) >= 1
     assert any(row["action_type"] == "EXECUTABLE_JOB" for row in next_actions)
     assert all(row["status"] == "pending" for row in next_actions)

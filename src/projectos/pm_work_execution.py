@@ -5,13 +5,91 @@ from __future__ import annotations
 from projectos.domain_events import ACTOR_PM, EventContext, emit_projectos_event
 from projectos.errors import OrchestrationError
 from projectos.execution_run import update_execution_run
+from projectos.intake import IntakeService
+from projectos.registry import load_registry
 from projectos.run_evidence import pause_run_for_sponsor_decision
 from projectos.run_next_actions import persist_run_next_action
 from projectos.services.context import ServiceContext
 from projectos.slack_advisor_handoff import HandoffRequest
 from projectos.slack_sponsor_format import SPONSOR_ACCEPTANCE
 from projectos.sponsor_execution_authority import SponsorExecutionAuthority
-from projectos.store import get_job_by_human_id, list_eligible_ready_jobs
+from projectos.store import create_job, get_job_by_human_id, list_eligible_ready_jobs
+
+
+def _schedule_work_execution_recovery(
+    conn,
+    *,
+    ctx: ServiceContext,
+    thread: EventContext,
+    run_id: str,
+    project_id: str,
+    authority: SponsorExecutionAuthority,
+    reason: str,
+) -> str:
+    registry = load_registry(ctx.registry_path)
+    entry = registry.get(project_id)
+    if entry is None or not entry.repository_root:
+        raise OrchestrationError(
+            f"Cannot schedule work execution recovery for unknown project {project_id!r}"
+        )
+    repository_root = str(entry.repository_root)
+    retry_job = create_job(
+        conn,
+        human_id=f"{run_id}__WORK_EXEC_SCHEDULE",
+        project_human_id=project_id,
+        repository_root=repository_root,
+        agent_role="PM",
+        queue="PM",
+        status="READY",
+        run_id=run_id,
+    )
+    action_id = persist_run_next_action(
+        conn,
+        run_id=run_id,
+        project_id=project_id,
+        action_type="EXECUTABLE_JOB",
+        orchestration_job_id=retry_job.id,
+        payload={
+            "reason": reason,
+            "authority_source": authority.authority_source,
+        },
+    )
+    update_execution_run(
+        conn,
+        run_id=run_id,
+        status="RUNNING",
+        current_phase="execution_recovery",
+        current_agent="PM Agent",
+        progress=45,
+        result_summary="PM scheduled recovery after authorized intake produced no executable jobs.",
+    )
+    emit_projectos_event(
+        conn,
+        ctx=thread,
+        event_type="PM_REPLAN",
+        summary="PM scheduled work execution recovery.",
+        actor_id=ACTOR_PM,
+        phase="execution_recovery",
+        detail_level="milestone",
+        metadata={
+            "reason": reason,
+            "next_action_id": action_id,
+            "retry_job_id": retry_job.id,
+        },
+    )
+    update_execution_run(
+        conn,
+        run_id=run_id,
+        status="RUNNING",
+        current_phase="execution_recovery",
+        current_agent="PM Agent",
+        progress=45,
+        result_summary="PM scheduled recovery after authorized intake produced no executable jobs.",
+    )
+    return (
+        f"PM scheduled work execution recovery for `{project_id}` "
+        f"after authorized intake produced no executable jobs."
+    )
 
 
 def begin_authorized_work_execution(
@@ -25,7 +103,6 @@ def begin_authorized_work_execution(
     authority: SponsorExecutionAuthority,
 ) -> str:
     """Submit governed work intake and schedule durable executable next actions."""
-    from projectos.intake import IntakeService
 
     explicit_new_project = authority.authority_source == "explicit_new_project"
     kwargs = {
@@ -104,6 +181,17 @@ def begin_authorized_work_execution(
         )
         scheduled.append(job.id)
 
+    if not scheduled:
+        return _schedule_work_execution_recovery(
+            conn,
+            ctx=ctx,
+            thread=thread,
+            run_id=run_id,
+            project_id=project_id,
+            authority=authority,
+            reason="no_executable_jobs_after_authorized_intake",
+        )
+
     update_execution_run(
         conn,
         run_id=run_id,
@@ -133,11 +221,21 @@ def begin_authorized_work_execution(
         event_type="WORK_EXECUTION_AUTHORIZED",
         summary="Execution authorized by authenticated Sponsor action.",
         actor_id=ACTOR_PM,
+        phase="execution",
         detail_level="milestone",
         metadata={
             "authority_source": authority.authority_source,
             "scheduled_job_ids": scheduled,
         },
+    )
+    update_execution_run(
+        conn,
+        run_id=run_id,
+        status="RUNNING",
+        current_phase="execution",
+        current_agent="PM Agent",
+        progress=50,
+        result_summary="Sponsor-authorized work execution started.",
     )
     return (
         f"PM accepted Sponsor-authorized work for `{project_id}` and scheduled "

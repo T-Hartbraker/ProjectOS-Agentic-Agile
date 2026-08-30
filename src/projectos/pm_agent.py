@@ -33,9 +33,10 @@ from projectos.slack_activity_blocks import handoff_accepted_blocks
 from projectos.slack_advisor_handoff import HandoffRequest
 from projectos.sponsor_directive import classify_sponsor_ingress, directive_requires_replan
 from projectos.sponsor_execution_authority import (
+    SponsorExecutionAuthority,
     authority_from_handoff,
-    classify_sponsor_execution_authority,
     merge_authority_into_constraints,
+    strip_untrusted_authority_fields,
 )
 from projectos.sponsor_handoff import (
     create_sponsor_handoff,
@@ -284,16 +285,26 @@ def accept_sponsor_handoff(
     advisor_text: str = "",
     request_type_override: str | None = None,
     explicit_new_project: bool = False,
+    sponsor_authority: SponsorExecutionAuthority | None = None,
 ) -> PmHandoffResult:
     existing = get_latest_thread_handoff(
         conn, team_id=team_id, channel_id=channel_id, thread_ts=thread_ts
     )
     request_type = request_type_override or _request_type_for_handoff(handoff)
-    authority = classify_sponsor_execution_authority(
-        handoff.objective,
-        explicit_new_project=explicit_new_project,
-    )
-    constraints_json = merge_authority_into_constraints(handoff.constraints, authority)
+    if sponsor_authority is not None:
+        authority = sponsor_authority
+    else:
+        authority = authority_from_handoff(handoff, sponsor_user_id=sponsor_user_id)
+    if authority.execution_authorized:
+        constraints_json = merge_authority_into_constraints(
+            handoff.constraints,
+            authority,
+            sponsor_user_id=sponsor_user_id,
+        )
+    else:
+        constraints_json = strip_untrusted_authority_fields(handoff.constraints)
+        if not constraints_json.startswith("{"):
+            constraints_json = "{}"
     active_run = None
     if existing and existing.status == "ACCEPTED_BY_PM" and existing.run_id:
         active_run = get_execution_run(conn, existing.run_id)
@@ -970,7 +981,7 @@ def _orchestrate_work_handoff(
         phases=phases,
         current="PM Agent creating governed preview.",
     )
-    authority = authority_from_handoff(handoff, explicit_new_project=explicit_new_project)
+    authority = authority_from_handoff(handoff, sponsor_user_id=sponsor_user_id)
 
     if is_work_mutation(handoff.action_type) and authority.execution_authorized:
         from projectos.pm_work_execution import begin_authorized_work_execution

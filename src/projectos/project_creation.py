@@ -506,7 +506,12 @@ def _record_creation(
     )
 
 
-def _build_handoff(project_id: str, raw_request: str) -> HandoffRequest:
+def _build_handoff(
+    project_id: str,
+    raw_request: str,
+    *,
+    sponsor_user_id: str,
+) -> HandoffRequest:
     cap = classify_request(text=raw_request, fallback_objective=raw_request)
     desired = dict(cap.desired_outputs)
     lowered = raw_request.casefold()
@@ -519,6 +524,9 @@ def _build_handoff(project_id: str, raw_request: str) -> HandoffRequest:
     authority = classify_sponsor_execution_authority(
         raw_request,
         explicit_new_project=True,
+        authenticated_sponsor_action=True,
+        authority_ingress="slack_new_project",
+        sponsor_user_id=sponsor_user_id,
     )
     constraints_json = merge_authority_into_constraints(
         json.dumps(constraints, sort_keys=True),
@@ -672,7 +680,11 @@ def create_project_from_sponsor_request(
             thread_ts=request.thread_ts,
         )
 
-        handoff = _build_handoff(project_human_id, request.raw_request)
+        handoff = _build_handoff(
+            project_human_id,
+            request.raw_request,
+            sponsor_user_id=request.sponsor_user_id,
+        )
         pm_result = accept_sponsor_handoff(
             ctx,
             conn,

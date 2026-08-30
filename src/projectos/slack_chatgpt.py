@@ -56,6 +56,7 @@ from projectos.advisor_errors import (
 from projectos.chatgpt_store import list_chatgpt_messages
 from projectos.pm_agent import accept_sponsor_handoff, compose_server_handoff
 from projectos.pm_capabilities import ensure_pm_run_for_approved_proposal, execute_approved_proposal_via_pm
+from projectos.sponsor_execution_authority import classify_sponsor_execution_authority
 from projectos.sponsor_action_audit import record_sponsor_action_audit
 from projectos.sponsor_action_intent import detect_sponsor_action_intent
 from projectos.sponsor_query import SponsorQueryService
@@ -687,6 +688,7 @@ def _attempt_resilient_handoff(
         thread_key=thread_key,
         sponsor_user_id=sponsor_user_id,
         advisor_text=advisor_text or "Proceeding with governed PM handoff.",
+        sponsor_message=cleaned,
     )
     return advisor_note, projectos_result, True
 
@@ -734,7 +736,14 @@ def _process_handoff(
     thread_key: str,
     sponsor_user_id: str,
     advisor_text: str,
+    sponsor_message: str,
 ) -> tuple[str, str | None]:
+    authority = classify_sponsor_execution_authority(
+        sponsor_message,
+        authenticated_sponsor_action=True,
+        authority_ingress="slack_sponsor_message",
+        sponsor_user_id=sponsor_user_id,
+    )
     try:
         result = accept_sponsor_handoff(
             ctx,
@@ -746,6 +755,7 @@ def _process_handoff(
             thread_ts=thread_key,
             sponsor_user_id=sponsor_user_id,
             advisor_text=_sanitize_advisor_text(advisor_text),
+            sponsor_authority=authority,
         )
     except OrchestrationError as exc:
         return _sanitize_advisor_text(advisor_text), (
@@ -1165,6 +1175,7 @@ def handle_chatgpt_slack_message(
                     thread_key=thread_key,
                     sponsor_user_id=thread["sponsor_user_id"],
                     advisor_text=advisor_text,
+                    sponsor_message=cleaned,
                 )
                 record_sponsor_action_audit(
                     conn,

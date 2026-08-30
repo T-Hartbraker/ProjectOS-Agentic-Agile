@@ -83,13 +83,16 @@ def _parse_handoff_payload(payload: dict) -> HandoffRequest | None:
     action_type = normalize_action_type(
         str(payload.get("action_type") or payload.get("intent") or "work_request")
     )
+    constraints_raw = str(payload.get("constraints") or "")[:MAX_FIELD_CHARS]
+    from projectos.sponsor_execution_authority import strip_untrusted_authority_fields
+
     return HandoffRequest(
         project_id=str(payload.get("project_id") or "").strip().upper(),
         objective=objective[:MAX_FIELD_CHARS],
         action_type=action_type,
         rationale=str(payload.get("rationale") or "")[:MAX_FIELD_CHARS],
         scope=str(payload.get("scope") or "")[:MAX_FIELD_CHARS],
-        constraints=str(payload.get("constraints") or "")[:MAX_FIELD_CHARS],
+        constraints=strip_untrusted_authority_fields(constraints_raw)[:MAX_FIELD_CHARS],
         acceptance_intent=str(payload.get("acceptance_intent") or "")[:MAX_FIELD_CHARS],
         exclusions=str(payload.get("exclusions") or "")[:MAX_FIELD_CHARS],
         source_conversation_summary=str(payload.get("source_conversation_summary") or "")[
