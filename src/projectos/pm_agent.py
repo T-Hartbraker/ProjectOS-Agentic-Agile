@@ -32,6 +32,11 @@ from projectos.services.context import ServiceContext
 from projectos.slack_activity_blocks import handoff_accepted_blocks
 from projectos.slack_advisor_handoff import HandoffRequest
 from projectos.sponsor_directive import classify_sponsor_ingress, directive_requires_replan
+from projectos.sponsor_execution_authority import (
+    authority_from_handoff,
+    classify_sponsor_execution_authority,
+    merge_authority_into_constraints,
+)
 from projectos.sponsor_handoff import (
     create_sponsor_handoff,
     get_latest_thread_handoff,
@@ -284,6 +289,11 @@ def accept_sponsor_handoff(
         conn, team_id=team_id, channel_id=channel_id, thread_ts=thread_ts
     )
     request_type = request_type_override or _request_type_for_handoff(handoff)
+    authority = classify_sponsor_execution_authority(
+        handoff.objective,
+        explicit_new_project=explicit_new_project,
+    )
+    constraints_json = merge_authority_into_constraints(handoff.constraints, authority)
     active_run = None
     if existing and existing.status == "ACCEPTED_BY_PM" and existing.run_id:
         active_run = get_execution_run(conn, existing.run_id)
@@ -325,7 +335,7 @@ def accept_sponsor_handoff(
         objective=handoff.objective,
         rationale=handoff.rationale,
         scope=handoff.scope,
-        constraints_json=handoff.constraints if handoff.constraints.startswith("{") else "{}",
+        constraints_json=constraints_json,
         acceptance_intent=handoff.acceptance_intent,
         exclusions=handoff.exclusions,
         desired_outputs_json=(
@@ -960,6 +970,30 @@ def _orchestrate_work_handoff(
         phases=phases,
         current="PM Agent creating governed preview.",
     )
+    authority = authority_from_handoff(handoff, explicit_new_project=explicit_new_project)
+
+    if is_work_mutation(handoff.action_type) and authority.execution_authorized:
+        from projectos.pm_work_execution import begin_authorized_work_execution
+
+        execution_evidence = begin_authorized_work_execution(
+            ctx,
+            conn,
+            handoff=handoff,
+            run_id=run.run_id,
+            project_id=thread.project_id,
+            thread=thread,
+            authority=authority,
+        )
+        return PmHandoffResult(
+            handoff_id=record_handoff_id,
+            run_id=run.run_id,
+            request_type=request_type,
+            advisor_note=advisor_note,
+            projectos_text=projectos_text,
+            projectos_blocks=projectos_blocks,
+            execution_evidence=execution_evidence,
+        )
+
     from projectos.run_outcomes import OUTCOME_SPONSOR_DECISION_REQUIRED, run_status_for_outcome
     from projectos.run_evidence import pause_run_for_sponsor_decision
 

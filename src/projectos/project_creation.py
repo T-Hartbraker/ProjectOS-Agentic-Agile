@@ -35,6 +35,10 @@ from projectos.slack_advisor_handoff import HandoffRequest
 from projectos.slack_resolver import authorize_slack_channel, set_session_project
 from projectos.slack_sponsor_format import SPONSOR_ACCEPTANCE
 from projectos.slack_thread_context import mark_projectos_thread_active
+from projectos.sponsor_execution_authority import (
+    classify_sponsor_execution_authority,
+    merge_authority_into_constraints,
+)
 from projectos.store import require_safe_id
 
 _PRJ_NUM_RE = re.compile(r"^PRJ-(\d+)$", re.IGNORECASE)
@@ -512,13 +516,21 @@ def _build_handoff(project_id: str, raw_request: str) -> HandoffRequest:
         desired["automated_tests"] = True
     constraints = dict(cap.constraints)
     constraints["preserve_raw_sponsor_request"] = True
+    authority = classify_sponsor_execution_authority(
+        raw_request,
+        explicit_new_project=True,
+    )
+    constraints_json = merge_authority_into_constraints(
+        json.dumps(constraints, sort_keys=True),
+        authority,
+    )
     return HandoffRequest(
         project_id=project_id,
         objective=raw_request.strip(),
         action_type="work_request",
         rationale="Sponsor explicitly requested a new governed delivery project.",
         scope="",
-        constraints=json.dumps(constraints, sort_keys=True),
+        constraints=constraints_json,
         acceptance_intent=SPONSOR_ACCEPTANCE,
         exclusions="",
         source_conversation_summary=raw_request.strip()[:1500],

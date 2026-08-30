@@ -47,9 +47,18 @@ def fast_plan_cursor(monkeypatch):
             returncode=0,
             stdout=json.dumps(
                 {
+                    "schema_version": 1,
                     "project_human_id": "PRJ-004",
                     "iteration_human_id": "ITER-001",
-                    "jobs": [],
+                    "sponsor_authority": "approved",
+                    "jobs": [
+                        {
+                            "human_id": "PRJ-004-ARCH-001",
+                            "queue": "ARCHITECTURE",
+                            "agent_role": "ARCHITECTURE",
+                            "depends_on": [],
+                        }
+                    ],
                 }
             ),
             stderr="",
@@ -216,16 +225,20 @@ def test_direct_projectos_new_project_request_creates_project_and_starts_run(
             conn, team_id="T1", channel_id="G_PRIVATE", thread_ts="200.0"
         )
         run_row = conn.execute(
-            "SELECT run_id, objective FROM execution_runs WHERE project_id = ?",
+            "SELECT run_id, objective, status, result_summary FROM execution_runs WHERE project_id = ?",
             ("PRJ-004",),
         ).fetchone()
         decision_rows = conn.execute(
             "SELECT reason FROM governance_decisions WHERE project_human_id = ?",
             ("PRJ-004",),
         ).fetchall()
-        next_action = conn.execute(
-            "SELECT COUNT(*) AS total FROM run_next_actions WHERE run_id = ?",
+        next_actions = conn.execute(
+            "SELECT action_type, status FROM run_next_actions WHERE run_id = ?",
             (run_row["run_id"],),
+        ).fetchall()
+        handoff_constraints = conn.execute(
+            "SELECT constraints_json FROM sponsor_handoffs WHERE handoff_id = ?",
+            (handoff.handoff_id,),
         ).fetchone()
 
     assert slack_ctx is not None
@@ -236,10 +249,20 @@ def test_direct_projectos_new_project_request_creates_project_and_starts_run(
     assert run_row is not None
     assert "zip" in run_row["objective"].casefold()
     assert "calculator" in run_row["objective"].casefold()
+    assert run_row["status"] == "RUNNING"
+    assert run_row["status"] != "WAITING_FOR_SPONSOR"
+    assert "Sponsor approval required before execution" not in str(
+        run_row["result_summary"] or ""
+    )
+    constraints = json.loads(handoff_constraints["constraints_json"])
+    assert constraints.get("execution_authorized") is True
+    assert constraints.get("authority_source") == "explicit_new_project"
+    assert len(next_actions) >= 1
+    assert any(row["action_type"] == "EXECUTABLE_JOB" for row in next_actions)
+    assert all(row["status"] == "pending" for row in next_actions)
     desired = json.loads(handoff.desired_outputs_json or "{}")
     assert desired.get("zip_package") is True
     assert not any("scope_new_venture" in str(row["reason"]).casefold() for row in decision_rows)
-    assert int(next_action["total"]) >= 0
 
     original = load_repository_identity(Path(registry.get("PRJ-003").repository_root))
     assert original.project_human_id == "PRJ-003"
