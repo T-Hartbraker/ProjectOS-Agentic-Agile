@@ -87,12 +87,21 @@ PROJECTOS_PREFIX = "*ProjectOS:*"
 _PROJECT_ID_RE = re.compile(r"\b(PRJ-[A-Z0-9]+)\b", re.IGNORECASE)
 READ_ONLY_REQUEST_RE = re.compile(
     r"\b(summary|summarize|status|health|overview|quality|qa|releases?|"
-    r"what needs to be done|why did it stop|what blocked|what do i need to fix|can we retry|"
+    r"what needs to be done|why did it stop|why did it fail|what happened|what's blocking|"
+    r"what is blocking|why did projectos stop|what is the current error|can it recover|"
+    r"what do i need to fix|can we retry|"
     r"blocker|blocked|failed)\b",
     re.IGNORECASE,
 )
 BLOCKER_QUESTION_RE = re.compile(
-    r"\b(what needs to be done|why did it stop|what blocked|what do i need to fix|can we retry)\b",
+    r"\b(what needs to be done|why did it stop|why did it fail|what happened|"
+    r"what(?:'s| is) blocking|why did projectos stop|what is the current error|"
+    r"can it recover|what do i need to fix|can we retry)\b",
+    re.IGNORECASE,
+)
+FAILURE_EXPLANATION_RE = re.compile(
+    r"\b(why did it fail|what happened|what(?:'s| is) blocking|why did projectos stop|"
+    r"what is the current error|can it recover)\b",
     re.IGNORECASE,
 )
 PROPOSAL_STATE_QUESTION_RE = re.compile(
@@ -246,6 +255,8 @@ def _looks_like_read_only_request(text: str) -> bool:
 
 
 def _read_only_intent(text: str) -> str:
+    if FAILURE_EXPLANATION_RE.search(str(text or "")):
+        return "failure"
     if BLOCKER_QUESTION_RE.search(str(text or "")):
         return "blocker"
     if re.search(r"\bJOB-[A-Z0-9_-]+\b", str(text or ""), re.IGNORECASE):
@@ -520,9 +531,16 @@ def _flush_projectos_outbox(ctx: ServiceContext, http_post: HttpPost | None = No
     dispatch_event_outbox(ctx.db_path, http_post=http_post)
 
 
-def _fetch_read_only_projectos_data(ctx: ServiceContext, *, project_id: str, cleaned: str) -> str:
+def _fetch_read_only_projectos_data(
+    ctx: ServiceContext, *, project_id: str, cleaned: str, thread_key: str = ""
+) -> str:
     intent = _read_only_intent(cleaned)
-    return SponsorQueryService(ctx).query_for_advisor(project_id, intent)
+    return SponsorQueryService(ctx).query_for_advisor(
+        project_id,
+        intent,
+        raw_text=cleaned,
+        thread_key=thread_key or None,
+    )
 
 
 def _thread_key(thread_ts: str | None, message_ts: str | None) -> str:
@@ -597,13 +615,26 @@ def _build_model_input(
     return "\n\n".join(lines)
 
 
-def _optional_fresh_projectos_facts(ctx: ServiceContext, *, project_id: str, cleaned: str) -> str:
+def _optional_fresh_projectos_facts(
+    ctx: ServiceContext, *, project_id: str, cleaned: str, thread_key: str = ""
+) -> str:
     if not _looks_like_read_only_request(cleaned) and not re.search(
         r"\bJOB-[A-Z0-9_-]+\b", cleaned, re.IGNORECASE
     ):
         return ""
     intent = _read_only_intent(cleaned)
-    return SponsorQueryService(ctx).query_for_advisor(project_id, intent, raw_text=cleaned)
+    return SponsorQueryService(ctx).query_for_advisor(
+        project_id,
+        intent,
+        raw_text=cleaned,
+        thread_key=thread_key or None,
+    )
+
+
+def _looks_like_failure_explanation_request(text: str) -> bool:
+    if looks_like_handoff_trigger(text) or looks_like_approval(text):
+        return False
+    return bool(FAILURE_EXPLANATION_RE.search(str(text or "")))
 
 
 def _safe_build_authoritative_context(
@@ -949,6 +980,29 @@ def handle_chatgpt_slack_message(
 
         response_id = thread.get("openai_response_id")
 
+        if _looks_like_failure_explanation_request(cleaned):
+            explanation = SponsorQueryService(ctx).get_failure_explanation(
+                project_id,
+                thread_key=thread_key,
+            )
+            projectos_text = f"{PROJECTOS_PREFIX}\n{explanation}"
+            advisor_text = (
+                "Here is the authoritative ProjectOS failure explanation for this thread."
+            )
+            _persist_turn(
+                conn,
+                team_id=team_id or "",
+                channel_id=channel_id,
+                thread_key=thread_key,
+                sponsor_user_id=thread["sponsor_user_id"],
+                project_id=project_id,
+                message_ts=str(message_ts or thread_key),
+                advisor_text=advisor_text,
+                projectos_text=projectos_text,
+                response_id=response_id,
+            )
+            return dual_response(advisor_text=advisor_text, projectos_text=projectos_text)
+
         if _looks_like_proposal_state_question(cleaned):
             advisor_text, projectos_text = _answer_proposal_state_question(
                 conn,
@@ -1057,7 +1111,12 @@ def handle_chatgpt_slack_message(
         fresh_facts = ""
         action_intent = detect_sponsor_action_intent(cleaned)
         try:
-            fresh_facts = _optional_fresh_projectos_facts(ctx, project_id=project_id, cleaned=cleaned)
+            fresh_facts = _optional_fresh_projectos_facts(
+                ctx,
+                project_id=project_id,
+                cleaned=cleaned,
+                thread_key=thread_key,
+            )
         except Exception as exc:
             classified = classify_advisor_exception(exc, stage="Sponsor context / release formatting")
             record_sponsor_action_audit(

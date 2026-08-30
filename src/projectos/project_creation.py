@@ -553,15 +553,20 @@ def _format_creation_reply(
     objective: str,
     run_id: str,
     idempotent: bool = False,
+    execution_note: str = "",
 ) -> str:
     prefix = "New project already initiated" if idempotent else "New project initiated"
     objective_line = objective.strip().splitlines()[0][:240]
-    return (
-        f"{prefix}: `{project_human_id}`\n"
-        f"Objective: {objective_line}\n"
-        f"Run: `{run_id}`\n"
-        f"PM planning/execution started for {project_name}."
-    )
+    lines = [
+        f"{prefix}: `{project_human_id}`",
+        f"Objective: {objective_line}",
+        f"Run: `{run_id}`",
+        f"PM planning/execution started for {project_name}.",
+    ]
+    note = str(execution_note or "").strip()
+    if note and "Sponsor-authorized work" not in note:
+        lines.append(note)
+    return "\n".join(lines)
 
 
 def _remove_repository_tree(path: Path | None) -> None:
@@ -709,6 +714,7 @@ def create_project_from_sponsor_request(
                 project_name=project_name,
                 objective=request.raw_request,
                 run_id=pm_result.run_id,
+                execution_note=pm_result.execution_evidence or "",
             ),
         )
         _record_creation(conn, dedup_key=dedup_key, request=request, result=result)

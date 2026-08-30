@@ -156,8 +156,10 @@ def test_plan_accepts_and_dry_run(tmp_path: Path) -> None:
                 "human_id": "JOB-P1",
                 "queue": "DELIVERY",
                 "agent_role": "DELIVERY",
-                "work_item_type": "story",
-                "work_item_human_id": "STORY-1",
+                "requirement_ref": "story:STORY-1",
+                "acceptance_criteria": [
+                    "AC-001: Given X when Y then Z",
+                ],
                 "depends_on": [],
                 "priority": 10,
             }

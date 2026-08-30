@@ -25,9 +25,10 @@ from projectos.registry import load_registry
 from projectos.repository import load_repository_identity
 from projectos.services.context import ServiceContext
 from projectos.slack_intent import SlackIntent, classify_projectos_intent
+from projectos.projectctl_bridge import read_work_item_ids
 from projectos.slack_socket import handle_events_api_payload, handle_projectos_request
 from projectos.sponsor_handoff import get_latest_thread_handoff
-from projectos.store import add_slack_interface_channel, get_slack_project_context
+from projectos.store import add_slack_interface_channel, get_job_by_human_id, get_slack_project_context
 
 FAT_MESSAGE = (
     "Start a new project to build a simple Python command-line calculator. It must "
@@ -42,22 +43,36 @@ FAT_MESSAGE = (
 @pytest.fixture
 def fast_plan_cursor(monkeypatch):
     def _fake_cursor(**kwargs):
+        project_id = "PRJ-004"
         return CursorRunResult(
             command=[],
             returncode=0,
             stdout=json.dumps(
                 {
                     "schema_version": 1,
-                    "project_human_id": "PRJ-004",
+                    "project_human_id": project_id,
                     "iteration_human_id": "ITER-001",
                     "sponsor_authority": "approved",
                     "jobs": [
                         {
-                            "human_id": "PRJ-004-ARCH-001",
+                            "human_id": f"{project_id}-ARCH-001",
                             "queue": "ARCHITECTURE",
                             "agent_role": "ARCHITECTURE",
                             "depends_on": [],
-                        }
+                        },
+                        {
+                            "human_id": f"{project_id}-DEL-001",
+                            "queue": "DELIVERY",
+                            "agent_role": "DELIVERY",
+                            "work_item_type": "story",
+                            "work_item_human_id": "US-001",
+                            "title": "Calculator CLI with four operations",
+                            "acceptance_criteria": [
+                                "Supports addition, subtraction, multiplication, and division",
+                                "Includes automated tests",
+                            ],
+                            "depends_on": [f"{project_id}-ARCH-001"],
+                        },
                     ],
                 }
             ),
@@ -265,6 +280,21 @@ def test_direct_projectos_new_project_request_creates_project_and_starts_run(
     desired = json.loads(handoff.desired_outputs_json or "{}")
     assert desired.get("zip_package") is True
     assert not any("scope_new_venture" in str(row["reason"]).casefold() for row in decision_rows)
+
+    known = read_work_item_ids(repo, python_executable=venv_python)
+    assert "US-001" in known.get("story", set())
+    with connection(ctx.db_path) as conn:
+        delivery_job = get_job_by_human_id(conn, "PRJ-004-DEL-001")
+        failure_events = conn.execute(
+            """
+            SELECT COUNT(*) AS total FROM projectos_events
+            WHERE run_id = ? AND event_type = 'OPERATION_FAILED'
+            """,
+            (run_row["run_id"],),
+        ).fetchone()
+    assert delivery_job is not None
+    assert delivery_job.work_item_human_id == "US-001"
+    assert int(failure_events["total"]) == 0
 
     original = load_repository_identity(Path(registry.get("PRJ-003").repository_root))
     assert original.project_human_id == "PRJ-003"

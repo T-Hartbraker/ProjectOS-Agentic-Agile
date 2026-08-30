@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import re
+
 from projectos.domain_events import ACTOR_PM, EventContext, emit_projectos_event
 from projectos.errors import OrchestrationError
 from projectos.execution_run import update_execution_run
 from projectos.intake import IntakeService
+from projectos.operational_failure import (
+    format_sponsor_failure_explanation,
+    record_operational_failure,
+    sanitize_operational_detail,
+)
 from projectos.registry import load_registry
 from projectos.run_evidence import pause_run_for_sponsor_decision
 from projectos.run_next_actions import persist_run_next_action
@@ -14,6 +21,11 @@ from projectos.slack_advisor_handoff import HandoffRequest
 from projectos.slack_sponsor_format import SPONSOR_ACCEPTANCE
 from projectos.sponsor_execution_authority import SponsorExecutionAuthority
 from projectos.store import create_job, get_job_by_human_id, list_eligible_ready_jobs
+
+_UNKNOWN_WORK_ITEM_RE = re.compile(
+    r"unknown work item (?P<type>[a-z]+) (?P<id>[A-Z]+-\d+)",
+    re.IGNORECASE,
+)
 
 
 def _schedule_work_execution_recovery(
@@ -92,6 +104,62 @@ def _schedule_work_execution_recovery(
     )
 
 
+def _classify_intake_failure(error: str | None, status: str) -> tuple[str, str | None, str | None]:
+    detail = sanitize_operational_detail(str(error or status or "intake_failed"))
+    match = _UNKNOWN_WORK_ITEM_RE.search(detail)
+    if match:
+        return (
+            "missing_work_item_reference",
+            match.group("type").lower(),
+            match.group("id").upper(),
+        )
+    if status == "rejected":
+        return "plan_rejected", None, None
+    return "intake_submit_failed", None, None
+
+
+def _handle_authorized_intake_failure(
+    conn,
+    *,
+    ctx: ServiceContext,
+    thread: EventContext,
+    run_id: str,
+    project_id: str,
+    authority: SponsorExecutionAuthority,
+    result_error: str | None,
+    result_status: str,
+) -> str:
+    category, wi_type, wi_id = _classify_intake_failure(result_error, result_status)
+    evidence = record_operational_failure(
+        conn,
+        event_ctx=thread,
+        component="pm_work_execution",
+        operation="intake_submit",
+        error_category=category,
+        error_detail=str(result_error or result_status),
+        recoverable=True,
+        phase="intake",
+        work_item_type=wi_type,
+        work_item_human_id=wi_id,
+        metadata={"authority_source": authority.authority_source},
+    )
+    recovery = _schedule_work_execution_recovery(
+        conn,
+        ctx=ctx,
+        thread=thread,
+        run_id=run_id,
+        project_id=project_id,
+        authority=authority,
+        reason=f"authorized_intake_failed:{category}",
+    )
+    return format_sponsor_failure_explanation(
+        project_id=project_id,
+        run_id=run_id,
+        evidence=evidence,
+        recovery_summary=recovery,
+    )
+
+
 def begin_authorized_work_execution(
     ctx: ServiceContext,
     conn,
@@ -143,8 +211,15 @@ def begin_authorized_work_execution(
         return "Sponsor decision required before execution."
 
     if result.status not in {"submitted"}:
-        raise OrchestrationError(
-            f"Authorized work execution failed during intake submit: {result.error or result.status}"
+        return _handle_authorized_intake_failure(
+            conn,
+            ctx=ctx,
+            thread=thread,
+            run_id=run_id,
+            project_id=project_id,
+            authority=authority,
+            result_error=result.error,
+            result_status=result.status,
         )
 
     created_ids: list[int] = []

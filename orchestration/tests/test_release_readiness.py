@@ -95,8 +95,6 @@ def _phase2_plan(*, include_release_dep: bool = False) -> dict:
                 "human_id": "JOB-P2-DEL-DUE",
                 "queue": "DELIVERY",
                 "agent_role": "DELIVERY",
-                "work_item_type": "story",
-                "work_item_human_id": "US-007",
                 "requirement_ref": "story:US-007",
                 "acceptance_criteria": ["AC-1"],
                 "depends_on": ["JOB-P2-ARCH"],

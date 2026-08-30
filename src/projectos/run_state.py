@@ -52,6 +52,7 @@ _OPERATIONAL_PROGRESSION = {
     "RELEASE_PUBLISHED": ("RUNNING", "release-agent", 90),
     "SPONSOR_DIRECTIVE_RECEIVED": ("RUNNING", "pm-agent", 30),
     "PLAN_UPDATED": ("RUNNING", "pm-agent", 32),
+    "OPERATION_FAILED": ("execution_recovery", "pm-agent", 40),
     "WAITING_FOR_SPONSOR": (STATUS_WAITING_FOR_SPONSOR, "pm-agent", 40),
     "SPONSOR_DECISION_REQUIRED": (STATUS_WAITING_FOR_SPONSOR, "pm-agent", 40),
 }

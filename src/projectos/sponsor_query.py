@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from projectos.db import connection
+from projectos.operational_failure import format_sponsor_failure_explanation
 from projectos.migrate import initialize_database
 from projectos.run_state import run_status_summary
 from projectos.services.context import ServiceContext
@@ -186,8 +187,125 @@ class SponsorQueryService:
                 return self.get_run_status(project_id, run_id=run_id)
             return "\n".join(lines)
 
-    def query_for_advisor(self, project_id: str, intent: str, *, raw_text: str = "") -> str:
+    def get_failure_explanation(
+        self,
+        project_id: str,
+        *,
+        run_id: str | None = None,
+        thread_key: str | None = None,
+    ) -> str:
+        initialize_database(self.ctx.db_path)
+        with connection(self.ctx.db_path) as conn:
+            resolved_run_id = run_id
+            if not resolved_run_id and thread_key:
+                row = conn.execute(
+                    """
+                    SELECT run_id FROM sponsor_handoffs
+                    WHERE project_id = ? AND thread_ts = ?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (project_id, thread_key),
+                ).fetchone()
+                if row and row["run_id"]:
+                    resolved_run_id = str(row["run_id"])
+            if not resolved_run_id:
+                row = conn.execute(
+                    """
+                    SELECT run_id FROM execution_runs
+                    WHERE project_id = ?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (project_id,),
+                ).fetchone()
+                if row:
+                    resolved_run_id = str(row["run_id"])
+            if not resolved_run_id:
+                return (
+                    "No execution run is recorded for this project/thread, so ProjectOS "
+                    "does not contain authoritative failure evidence to explain."
+                )
+
+            failure_row = conn.execute(
+                """
+                SELECT summary, detail, evidence_json, metadata_json, occurred_at
+                FROM projectos_events
+                WHERE run_id = ? AND event_type = 'OPERATION_FAILED'
+                ORDER BY occurred_at DESC
+                LIMIT 1
+                """,
+                (resolved_run_id,),
+            ).fetchone()
+            if failure_row is None:
+                run = conn.execute(
+                    """
+                    SELECT status, result_summary, evidence_json
+                    FROM execution_runs WHERE run_id = ?
+                    """,
+                    (resolved_run_id,),
+                ).fetchone()
+                if run and str(run["result_summary"] or "").strip():
+                    return (
+                        f"Run: {resolved_run_id}\n"
+                        f"Status: {run['status']}\n"
+                        f"Summary: {run['result_summary']}"
+                    )
+                return (
+                    f"Run `{resolved_run_id}` exists, but ProjectOS does not contain "
+                    "authoritative failure evidence for this thread. "
+                    "I cannot invent a cause."
+                )
+
+            evidence: dict[str, Any] = {}
+            for raw in (failure_row["evidence_json"], failure_row["metadata_json"]):
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(str(raw))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    evidence.update(parsed)
+            if not evidence:
+                evidence = {
+                    "error_detail": str(failure_row["detail"] or failure_row["summary"] or ""),
+                    "error_category": "operational_failure",
+                    "recoverable": True,
+                }
+            recovery = conn.execute(
+                """
+                SELECT action_type, status FROM run_next_actions
+                WHERE run_id = ? AND status = 'pending'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (resolved_run_id,),
+            ).fetchone()
+            recovery_summary = ""
+            if recovery:
+                recovery_summary = (
+                    f"Recovery: durable next action `{recovery['action_type']}` "
+                    f"is pending for run `{resolved_run_id}`."
+                )
+            return format_sponsor_failure_explanation(
+                project_id=project_id,
+                run_id=resolved_run_id,
+                evidence=evidence,
+                recovery_summary=recovery_summary,
+            )
+
+    def query_for_advisor(
+        self,
+        project_id: str,
+        intent: str,
+        *,
+        raw_text: str = "",
+        thread_key: str | None = None,
+    ) -> str:
         intent = (intent or "summary").lower()
+        if intent in {"failure", "explain_failure", "why_failed"}:
+            return self.get_failure_explanation(
+                project_id,
+                thread_key=thread_key,
+            )
         if intent in {"blocker", "blockers", "blocked"}:
             return self.get_blocker_summary(project_id)
         if intent in {"quality", "qa"}:

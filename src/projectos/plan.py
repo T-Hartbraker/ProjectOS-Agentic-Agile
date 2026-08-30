@@ -16,6 +16,7 @@ from projectos.errors import OrchestrationError, ProjectOSError
 from projectos.migrate import initialize_database
 from projectos.paths import DEFAULT_DB_PATH, DEFAULT_REGISTRY_PATH
 from projectos.projectctl_bridge import read_work_item_ids, resolve_validated_repo
+from projectos.work_item_bootstrap import bootstrap_plan_work_items
 from projectos.store import (
     add_job_dependency,
     create_job,
@@ -475,6 +476,32 @@ def run_plan(
 
     assert plan is not None
 
+    if not dry_run:
+        bootstrap = bootstrap_plan_work_items(
+            plan,
+            repository_root=validated.git_root,
+            python_executable=validated.projectctl_python,
+            known_work_items=known,
+            projectctl_runner=projectctl_runner,
+        )
+        if bootstrap.id_map or bootstrap.created:
+            plan = bootstrap.plan
+            known = bootstrap.known_work_items
+    else:
+        augmented = {key: set(values) for key, values in known.items()}
+        for job in plan.get("jobs") or []:
+            if not isinstance(job, dict):
+                continue
+            wi_type = str(job.get("work_item_type") or "").strip().lower()
+            provisional = str(
+                job.get("provisional_work_item_ref")
+                or job.get("work_item_human_id")
+                or ""
+            ).strip()
+            if wi_type and provisional and wi_type in {"story", "requirement", "defect"}:
+                augmented.setdefault(wi_type, set()).add(provisional)
+        known = augmented
+
     with connection(path) as conn:
 
         def dup_check(pid: str, wi: str, queue: str) -> bool:
@@ -550,50 +577,57 @@ def run_plan(
         }
         created: list[str] = []
         id_map: dict[str, int] = {}
-        for job in plan["jobs"]:
-            queue = str(job["queue"])
-            role = str(job.get("agent_role") or QUEUE_TO_ROLE[queue])
-            created_job = create_job(
-                conn,
-                human_id=str(job["human_id"]),
-                project_human_id=project_human_id,
-                repository_root=validated.git_root,
-                agent_role=role,
-                queue=queue,
-                status="QUEUED" if queue == "RELEASE" else "READY",
-                priority=int(job.get("priority", 100)),
-                iteration_human_id=iteration_human_id
-                or plan.get("iteration_human_id"),
-                work_item_type=job.get("work_item_type"),
-                work_item_human_id=job.get("work_item_human_id"),
-                requires_worktree=role in {
-                    "DELIVERY",
-                    "ARCHITECTURE",
-                    "INTEGRATION",
-                    "RELEASE",
-                },
-                identity_snapshot=identity,
-                assignment=_assignment_from_plan_job(job),
-                allows_no_change=bool(job.get("allows_no_change", False)),
-            )
-            try:
-                conn.execute(
-                    """
-                    UPDATE orchestration_jobs
-                    SET sponsor_authority = ?
-                    WHERE id = ?
-                    """,
-                    (str(plan.get("sponsor_authority")), created_job.id),
+        created_job_ids: list[int] = []
+        try:
+            for job in plan["jobs"]:
+                queue = str(job["queue"])
+                role = str(job.get("agent_role") or QUEUE_TO_ROLE[queue])
+                created_job = create_job(
+                    conn,
+                    human_id=str(job["human_id"]),
+                    project_human_id=project_human_id,
+                    repository_root=validated.git_root,
+                    agent_role=role,
+                    queue=queue,
+                    status="QUEUED" if queue == "RELEASE" else "READY",
+                    priority=int(job.get("priority", 100)),
+                    iteration_human_id=iteration_human_id
+                    or plan.get("iteration_human_id"),
+                    work_item_type=job.get("work_item_type"),
+                    work_item_human_id=job.get("work_item_human_id"),
+                    requires_worktree=role in {
+                        "DELIVERY",
+                        "ARCHITECTURE",
+                        "INTEGRATION",
+                        "RELEASE",
+                    },
+                    identity_snapshot=identity,
+                    assignment=_assignment_from_plan_job(job),
+                    allows_no_change=bool(job.get("allows_no_change", False)),
                 )
-            except Exception:
-                pass
-            id_map[created_job.human_id] = created_job.id
-            created.append(created_job.human_id)
+                try:
+                    conn.execute(
+                        """
+                        UPDATE orchestration_jobs
+                        SET sponsor_authority = ?
+                        WHERE id = ?
+                        """,
+                        (str(plan.get("sponsor_authority")), created_job.id),
+                    )
+                except Exception:
+                    pass
+                id_map[created_job.human_id] = created_job.id
+                created_job_ids.append(created_job.id)
+                created.append(created_job.human_id)
 
-        for job in plan["jobs"]:
-            hid = str(job["human_id"])
-            for dep in job.get("depends_on") or []:
-                add_job_dependency(conn, id_map[hid], id_map[str(dep)])
+            for job in plan["jobs"]:
+                hid = str(job["human_id"])
+                for dep in job.get("depends_on") or []:
+                    add_job_dependency(conn, id_map[hid], id_map[str(dep)])
+        except Exception:
+            for job_id in created_job_ids:
+                conn.execute("DELETE FROM orchestration_jobs WHERE id = ?", (job_id,))
+            raise
 
         return PlanResult(
             status="accepted",
