@@ -897,12 +897,20 @@ def run_recovery(
     from projectos.domain_events import EventContext
     from projectos.execution_run import get_execution_run
     from projectos.remediation_recovery import resume_outstanding_remediation
+    from projectos.run_next_actions import reconcile_run_next_actions
 
     for run_id, proj_id in running_runs:
         with connection(path) as conn:
             run = get_execution_run(conn, run_id)
             if run is None:
                 continue
+            reconciled = reconcile_run_next_actions(
+                conn, run_id=run_id, project_id=proj_id
+            )
+            if reconciled:
+                report.messages.append(
+                    f"Reconciled {len(reconciled)} next action(s) for run {run_id}"
+                )
             event_ctx = EventContext(
                 project_id=proj_id,
                 handoff_id=run.handoff_id,

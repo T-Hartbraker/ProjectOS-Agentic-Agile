@@ -516,6 +516,7 @@ def process_socket_envelope(
     *,
     http_post: HttpPost | None = None,
     bot_user_id: str | None = None,
+    inline: bool = False,
 ) -> dict[str, Any]:
     envelope_id = str(envelope.get("envelope_id") or "").strip()
     kind = str(envelope.get("type") or "").strip()
@@ -529,6 +530,47 @@ def process_socket_envelope(
     ack = ack_envelope(envelope_id or "missing")
     if duplicate:
         return {"ack": ack, "duplicate": True, "reply": None}
+
+    if inline:
+        return _process_socket_envelope_inline(
+            ctx,
+            envelope_id=envelope_id,
+            kind=kind,
+            payload=payload,
+            ack=ack,
+            http_post=http_post,
+            bot_user_id=bot_user_id,
+        )
+
+    from projectos.slack_ingress import (
+        WORK_TYPE_EVENTS_API,
+        WORK_TYPE_SLASH_COMMAND,
+        enqueue_socket_work,
+    )
+
+    work_type = WORK_TYPE_SLASH_COMMAND if kind == "slash_commands" else WORK_TYPE_EVENTS_API
+    with connection(ctx.db_path) as conn:
+        enqueue_socket_work(
+            conn,
+            envelope_id=envelope_id or f"missing-{kind}",
+            work_type=work_type,
+            payload=payload,
+            bot_user_id=bot_user_id,
+        )
+        conn.commit()
+    return {"ack": ack, "duplicate": False, "reply": None, "enqueued": True}
+
+
+def _process_socket_envelope_inline(
+    ctx: ServiceContext,
+    *,
+    envelope_id: str,
+    kind: str,
+    payload: dict[str, Any],
+    ack: dict[str, Any],
+    http_post: HttpPost | None,
+    bot_user_id: str | None,
+) -> dict[str, Any]:
     reply: dict[str, Any] | None = None
     channel_id = ""
     thread_ts: str | None = None
@@ -654,8 +696,14 @@ def _run_websocket(
     def on_error(_ws, error):
         write_slack_state({"status": "error", "detail": _safe_detail(str(error))})
 
-    def on_close(_ws, _code, _reason):
-        write_slack_state({"status": "disconnected", "detail": "Socket Mode disconnected"})
+    def on_close(_ws, code, reason):
+        write_slack_state(
+            {
+                "status": "disconnected",
+                "detail": "Socket Mode disconnected",
+                "last_disconnect_reason": f"code={code} reason={reason}",
+            }
+        )
 
     app = WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
     app.run_forever(ping_interval=30, ping_timeout=10)

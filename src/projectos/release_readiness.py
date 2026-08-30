@@ -24,6 +24,7 @@ from projectos.projectctl_bridge import (
     run_projectctl,
 )
 from projectos.qa_handoff import REQUIRED_ASSURANCE
+from projectos.release_scope import ReleaseScope, resolve_release_scope, scope_jobs_for_release
 from projectos.store import OrchestrationJob, list_jobs_for_project
 from projectos.worktree import current_head_sha, is_dirty
 
@@ -232,27 +233,29 @@ def assemble_qa_package(
     expected_integration_sha: str,
     evidence_dir: Path,
     required_story_shas: dict[str, str] | None = None,
+    scope: ReleaseScope | None = None,
 ) -> tuple[dict[str, Any], list[str], list[StoryLineage]]:
     reasons: list[str] = []
-    jobs = list_jobs_for_project(conn, job.project_human_id)
+    release_scope = scope or resolve_release_scope(conn, job)
+    jobs = scope_jobs_for_release(conn, job)
     stories: list[StoryLineage] = []
 
-    pm = _find_queue(jobs, "PM")
-    arch = _find_queue(jobs, "ARCHITECTURE")
-    integ = _find_queue(jobs, "INTEGRATION")
-    if pm is None:
-        reasons.append("PM job has not SUCCEEDED")
-    if arch is None:
-        reasons.append("ARCHITECTURE job has not SUCCEEDED")
-    if integ is None:
-        reasons.append("INTEGRATION job has not SUCCEEDED")
-    elif integ.candidate_git_sha != expected_integration_sha:
-        reasons.append(
-            "INTEGRATION candidate "
-            f"{integ.candidate_git_sha} != required {expected_integration_sha}"
-        )
+    if release_scope.plan_source == "missing_plan":
+        reasons.append("no accepted PM plan defines release scope")
+        story_ids: list[str] = []
+    else:
+        story_ids = list(release_scope.delivery_story_ids)
+        if not story_ids:
+            reasons.append("accepted PM plan defines no DELIVERY work items for release")
 
-    story_ids = list(required_story_shas) if required_story_shas else ["US-007", "US-008"]
+    for queue in release_scope.required_gate_queues:
+        gate_job = _find_queue(jobs, queue)
+        if gate_job is None:
+            reasons.append(f"{queue} job has not SUCCEEDED")
+
+    if required_story_shas is None and release_scope.required_story_shas:
+        required_story_shas = release_scope.required_story_shas
+
     for story_id in story_ids:
         delivery = _find_story_delivery(jobs, story_id)
         if delivery is None:
@@ -286,6 +289,20 @@ def assemble_qa_package(
                 qa_manager_status=mgr.status if mgr else None,
             )
         )
+
+    integ = _find_queue(jobs, "INTEGRATION")
+    if (
+        integ is not None
+        and "INTEGRATION" in release_scope.required_gate_queues
+        and integ.candidate_git_sha != expected_integration_sha
+    ):
+        reasons.append(
+            "INTEGRATION candidate "
+            f"{integ.candidate_git_sha} != required {expected_integration_sha}"
+        )
+
+    pm = _find_queue(jobs, "PM")
+    arch = _find_queue(jobs, "ARCHITECTURE")
 
     package = {
         "project_human_id": job.project_human_id,
@@ -519,18 +536,16 @@ def evaluate_release_job(
         )
 
     story_shas = required_story_shas
-    if (
-        story_shas is None
-        and job.project_human_id == "PRJ-003"
-        and job.iteration_human_id == "ITER-002"
-    ):
-        story_shas = ACCEPTED_STORY_SHAS
+    scope = resolve_release_scope(conn, job)
+    if story_shas is None:
+        story_shas = scope.required_story_shas or None
     package, qa_reasons, stories = assemble_qa_package(
         conn,
         job,
         expected_integration_sha=sha,
         evidence_dir=ev_dir,
         required_story_shas=story_shas,
+        scope=scope,
     )
     reasons.extend(qa_reasons)
     qa_md = ev_dir / "qa-package.md"

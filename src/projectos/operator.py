@@ -315,10 +315,26 @@ def _slack_item(cfg: OperatorConfig, paths: OperatorPaths) -> dict[str, Any]:
         )
     tokens = token_report()
     ready = bool(tokens["app_token_present"] and tokens["bot_token_present"])
-    info = public_connection(enabled=True, tokens_ready=ready)
+    info = public_connection(
+        enabled=True,
+        tokens_ready=ready,
+        adapter_pid=pid,
+        adapter_alive=alive if pid else None,
+    )
     status = str(info.get("status") or "disconnected")
     detail = str(info.get("detail") or "")
     err = read_error(paths, COMPONENT_SLACK)
+    if status == "process_dead":
+        return _item(
+            COMPONENT_SLACK,
+            "process_dead",
+            required=True,
+            detail=detail or "Slack adapter process is not running",
+            pid=pid,
+        )
+    if not alive and ready and status == "connected":
+        status = "process_dead"
+        detail = detail or "Persisted Slack state shows connected but adapter process is dead"
     if status == "not_configured":
         return _item(
             COMPONENT_SLACK,
@@ -343,7 +359,7 @@ def _slack_item(cfg: OperatorConfig, paths: OperatorPaths) -> dict[str, Any]:
             detail=detail or "Socket Mode connected",
             pid=pid if alive else None,
         )
-    if status in {"connecting", "disconnected", "error"}:
+    if status in {"connecting", "disconnected", "error", "reconnecting"}:
         return _item(
             COMPONENT_SLACK,
             status,
@@ -405,6 +421,47 @@ def operator_health(
         "notice": notice,
         "components": components,
     }
+
+
+def maybe_respawn_slack_adapter(
+    ctx: ServiceContext,
+    *,
+    paths: OperatorPaths | None = None,
+    config: OperatorConfig | None = None,
+) -> bool:
+    """Respawn Slack adapter when enabled but process is dead."""
+    paths = paths or OperatorPaths()
+    cfg = config or load_operator_config(paths.config_path)
+    if not cfg.slack_enabled:
+        return False
+    pid = read_pid(paths, COMPONENT_SLACK)
+    if pid and pid_is_alive(pid):
+        return False
+    python = sys.executable
+    spawn_logged(
+        [
+            python,
+            "-m",
+            "projectos.slack_adapter",
+            "--config",
+            str(ctx.registry_path),
+            "--db",
+            str(ctx.db_path),
+            "--poll-seconds",
+            str(cfg.slack_poll_seconds),
+        ],
+        name=COMPONENT_SLACK,
+        paths=paths,
+    )
+    from projectos.slack_state import write_slack_state
+
+    write_slack_state(
+        {
+            "status": "connecting",
+            "detail": "Slack adapter respawned by operator supervision",
+        }
+    )
+    return True
 
 
 def _kill_pid(pid: int) -> None:

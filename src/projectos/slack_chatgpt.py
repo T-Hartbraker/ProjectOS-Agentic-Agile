@@ -939,6 +939,9 @@ def handle_chatgpt_slack_message(
                 sponsor_user_id=user_id,
                 active=True,
             )
+            if created.get("_outbox_delivered"):
+                _flush_projectos_outbox(ctx, http_post=http_post)
+                return None
             return single_advisor_response(str(created.get("text") or ""))
 
         project_id, resolve_error = _resolve_authoritative_project(

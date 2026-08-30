@@ -677,12 +677,14 @@ def test_same_event_id_different_envelopes_one_openai_call(tmp_path: Path, monke
         {"envelope_id": "env-a", "type": "events_api", "payload": payload},
         http_post=fake_post,
         bot_user_id="UBOT",
+        inline=True,
     )
     second = process_socket_envelope(
         ctx,
         {"envelope_id": "env-b", "type": "events_api", "payload": payload},
         http_post=fake_post,
         bot_user_id="UBOT",
+        inline=True,
     )
     assert first["duplicate"] is False
     assert first["reply"] is not None

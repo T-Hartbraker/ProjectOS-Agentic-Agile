@@ -219,6 +219,11 @@ def dispatch_event_outbox(
                     continue
                 channel_id = str(payload.get("slack_channel_id") or "")
                 thread_ts = str(payload.get("slack_thread_ts") or "") or None
+                response_url = str(
+                    (payload.get("metadata") or {}).get("response_url")
+                    or payload.get("response_url")
+                    or ""
+                ).strip() or None
                 if not channel_id:
                     with connection(db_path) as conn:
                         mark_subscriber_unroutable(
@@ -229,11 +234,18 @@ def dispatch_event_outbox(
                     unroutable += 1
                     continue
                 text, blocks = _slack_payload_to_blocks(payload)
+                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+                custom_blocks = metadata.get("blocks")
+                if isinstance(custom_blocks, list) and custom_blocks:
+                    blocks = custom_blocks
+                if str(payload.get("event_type") or "") == "SLACK_SPONSOR_REPLY":
+                    text = str(payload.get("summary") or text)
                 post_message(
                     channel_id=channel_id,
                     text=text,
                     thread_ts=thread_ts,
                     blocks=blocks,
+                    response_url=response_url,
                     http_post=http_post,
                 )
             with connection(db_path) as conn:

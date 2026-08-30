@@ -204,6 +204,20 @@ def run_daemon(
                 from projectos.event_dispatcher import dispatch_event_outbox
 
                 dispatch_event_outbox(path)
+                from projectos.slack_ingress import process_slack_ingress_batch
+
+                process_slack_ingress_batch(
+                    ServiceContext(db_path=path, registry_path=reg),
+                    limit=10,
+                )
+                dispatch_event_outbox(path)
+                from projectos.operator import maybe_respawn_slack_adapter
+
+                maybe_respawn_slack_adapter(
+                    ServiceContext(db_path=path, registry_path=reg),
+                    paths=None,
+                    config=None,
+                )
                 with connection(path) as conn:
                     _persist_daemon(
                         conn,

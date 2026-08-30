@@ -73,6 +73,14 @@ def create_assurance_jobs_for_delivery(
         }
 
     created: list[str] = []
+    delivery_run_id = delivery.run_id
+    if not delivery_run_id:
+        row = conn.execute(
+            "SELECT run_id FROM orchestration_jobs WHERE id = ?",
+            (delivery.id,),
+        ).fetchone()
+        if row and row["run_id"]:
+            delivery_run_id = str(row["run_id"])
     for queue in REQUIRED_ASSURANCE:
         human_id = f"{delivery.human_id}__{queue}"
         job = create_job(
@@ -90,7 +98,7 @@ def create_assurance_jobs_for_delivery(
             worktree_name=f"{delivery.project_human_id}__{human_id}",
             base_git_sha=candidate_git_sha,
             identity_snapshot=identity,
-            run_id=getattr(delivery, "run_id", None),
+            run_id=delivery_run_id,
         )
         set_job_source_provenance(
             conn,
@@ -108,7 +116,7 @@ def create_assurance_jobs_for_delivery(
             candidate_git_sha=candidate_git_sha,
             assurance_role=queue,
             result="pending",
-            run_id=getattr(delivery, "run_id", None),
+            run_id=delivery_run_id,
         )
         created.append(human_id)
 
@@ -127,7 +135,7 @@ def create_assurance_jobs_for_delivery(
         iteration_human_id=delivery.iteration_human_id,
         requires_worktree=False,
         identity_snapshot=identity,
-        run_id=getattr(delivery, "run_id", None),
+            run_id=delivery_run_id,
     )
     set_job_source_provenance(
         conn,
@@ -151,7 +159,7 @@ def create_assurance_jobs_for_delivery(
         candidate_git_sha=candidate_git_sha,
         assurance_role=QA_MANAGER_ROLE,
         result="pending",
-        run_id=getattr(delivery, "run_id", None),
+            run_id=delivery_run_id,
     )
     created.append(agg_id)
 

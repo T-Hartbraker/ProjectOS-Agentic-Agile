@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -155,6 +156,53 @@ def _seed_lineage(
         mark_succeeded(
             conn, integ.id, output_ref=None, candidate_git_sha=integration_sha
         )
+        plan = {
+            "schema_version": 1,
+            "project_human_id": "PRJ-003",
+            "iteration_human_id": "ITER-002",
+            "sponsor_authority": "approved",
+            "jobs": [
+                {"human_id": "JOB-P2-PM-SETUP", "queue": "PM", "agent_role": "PM"},
+                {
+                    "human_id": "JOB-P2-ARCH",
+                    "queue": "ARCHITECTURE",
+                    "agent_role": "ARCHITECTURE",
+                },
+                {
+                    "human_id": "JOB-P2-DEL-DUE-OVERDUE__REWORK-1",
+                    "queue": "DELIVERY",
+                    "agent_role": "DELIVERY",
+                    "work_item_type": "story",
+                    "work_item_human_id": "US-007",
+                },
+                {
+                    "human_id": "JOB-P2-DEL-PRIORITY-FILTER__REWORK-1",
+                    "queue": "DELIVERY",
+                    "agent_role": "DELIVERY",
+                    "work_item_type": "story",
+                    "work_item_human_id": "US-008",
+                },
+                {
+                    "human_id": "JOB-P2-INTEGRATION",
+                    "queue": "INTEGRATION",
+                    "agent_role": "INTEGRATION",
+                },
+            ],
+        }
+        conn.execute(
+            """
+            INSERT INTO pm_plan_runs (
+                project_human_id, repository_root, iteration_human_id,
+                dry_run, plan_json, status
+            ) VALUES (?, ?, ?, 0, ?, 'accepted')
+            """,
+            (
+                "PRJ-003",
+                str(repo.resolve()),
+                "ITER-002",
+                json.dumps(plan),
+            ),
+        )
 
 
 @dataclass
@@ -241,7 +289,7 @@ def test_qa_package_from_existing_evidence(tmp_path: Path) -> None:
             rel,
             expected_integration_sha=INTEG_SHA,
             evidence_dir=ev,
-            required_story_shas={},
+            required_story_shas=None,
         )
     assert not reasons
     assert package["integration_sha"] == INTEG_SHA
@@ -279,7 +327,7 @@ def test_gate_rejects_wrong_integration_sha(tmp_path: Path) -> None:
             evidence_root=tmp_path / "ev",
             ops=ctl,
             expected_integration_sha=INTEG_SHA,
-            required_story_shas={},
+            required_story_shas=None,
         )
     assert not result.approved
     assert any("INTEGRATION candidate" in r for r in result.reasons)
@@ -320,7 +368,7 @@ def test_release_evaluation_does_not_dirty_workspace(tmp_path: Path) -> None:
             evidence_root=ev,
             ops=ctl,
             expected_integration_sha=sha,
-            required_story_shas={},
+            required_story_shas=None,
         )
     assert not is_dirty(repo)
     assert current_head_sha(repo) == sha
@@ -427,7 +475,7 @@ def test_gate_rejects_without_qa(tmp_path: Path) -> None:
             evidence_root=tmp_path / "ev",
             ops=ctl,
             expected_integration_sha=INTEG_SHA,
-            required_story_shas={},
+            required_story_shas=None,
         )
     assert not result.approved
     assert result.outcome != GATE_READY_OUTCOME

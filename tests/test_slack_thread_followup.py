@@ -204,6 +204,7 @@ def test_socket_envelope_posts_thread_reply(tmp_path: Path, monkeypatch) -> None
         },
         http_post=fake_post,
         bot_user_id="UBOT",
+        inline=True,
     )
     process_socket_envelope(
         ctx,
@@ -214,6 +215,7 @@ def test_socket_envelope_posts_thread_reply(tmp_path: Path, monkeypatch) -> None
         },
         http_post=fake_post,
         bot_user_id="UBOT",
+        inline=True,
     )
     assert len(posts) == 2
     assert posts[1].get("thread_ts") == "100.0"

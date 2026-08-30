@@ -126,8 +126,8 @@ def test_ack_envelope_and_duplicate_handling(tmp_path: Path, monkeypatch) -> Non
         return {"ok": True}
 
     envelope = _slash_envelope("env-1", "use PRJ-A")
-    first = process_socket_envelope(ctx, envelope, http_post=http_post)
-    second = process_socket_envelope(ctx, envelope, http_post=http_post)
+    first = process_socket_envelope(ctx, envelope, http_post=http_post, inline=True)
+    second = process_socket_envelope(ctx, envelope, http_post=http_post, inline=True)
     assert first["ack"] == ack_envelope("env-1")
     assert first["duplicate"] is False
     assert second["duplicate"] is True

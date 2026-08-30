@@ -18,7 +18,9 @@ VALID_STATUSES = frozenset(
         "not_configured",
         "connecting",
         "connected",
+        "reconnecting",
         "disconnected",
+        "process_dead",
         "error",
     }
 )
@@ -92,7 +94,14 @@ def remember_envelope(envelope_id: str, *, path: Path | None = None) -> bool:
     return False
 
 
-def public_connection(*, enabled: bool, tokens_ready: bool, path: Path | None = None) -> dict[str, Any]:
+def public_connection(
+    *,
+    enabled: bool,
+    tokens_ready: bool,
+    path: Path | None = None,
+    adapter_pid: int | None = None,
+    adapter_alive: bool | None = None,
+) -> dict[str, Any]:
     state = read_slack_state(path)
     if not enabled:
         status = "disabled"
@@ -101,8 +110,18 @@ def public_connection(*, enabled: bool, tokens_ready: bool, path: Path | None = 
         status = "not_configured"
         detail = "Add Slack tokens in Settings → Integrations → Slack, then restart ProjectOS."
     else:
-        status = str(state.get("status") or "disconnected")
+        persisted = str(state.get("status") or "disconnected")
         detail = str(state.get("detail") or "")
+        if adapter_alive is False and adapter_pid:
+            status = "process_dead"
+            if not detail:
+                detail = f"Slack adapter process {adapter_pid} is not running."
+        elif persisted == "connected" and adapter_alive is False:
+            status = "process_dead"
+            if not detail:
+                detail = "Persisted connection state is stale; adapter process is not running."
+        else:
+            status = persisted
         if status == "not_configured":
             status = "disconnected"
             if not detail:
@@ -114,4 +133,8 @@ def public_connection(*, enabled: bool, tokens_ready: bool, path: Path | None = 
         "workspace_name": state.get("workspace_name"),
         "team_id": state.get("team_id"),
         "updated_at": state.get("updated_at"),
+        "reconnect_attempt": state.get("reconnect_attempt"),
+        "last_disconnect_reason": state.get("last_disconnect_reason"),
+        "adapter_alive": adapter_alive,
+        "adapter_pid": adapter_pid,
     }

@@ -327,6 +327,63 @@ def _next_action_is_live(conn: sqlite3.Connection, action: dict[str, Any]) -> bo
     return False
 
 
+def reconcile_run_next_actions(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    project_id: str,
+) -> list[str]:
+    """Complete stale actions and ensure a single executable next action when possible."""
+    from projectos.execution_run import get_execution_run
+    from projectos.run_outcomes import is_terminal_run_status
+    from projectos.store import list_jobs_for_run
+
+    ensure_run_next_actions_table(conn)
+    run = get_execution_run(conn, run_id)
+    if run is None or is_terminal_run_status(run.status):
+        return []
+
+    actions = conn.execute(
+        """
+        SELECT action_id, orchestration_job_id, status
+        FROM run_next_actions
+        WHERE run_id = ? AND status IN ('pending', 'claimed')
+        ORDER BY created_at ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    reconciled: list[str] = []
+    for row in actions:
+        job_id = row["orchestration_job_id"]
+        if job_id is None:
+            continue
+        job = conn.execute(
+            "SELECT status FROM orchestration_jobs WHERE id = ?",
+            (int(job_id),),
+        ).fetchone()
+        if job is not None and str(job["status"]) in _TERMINAL_JOB:
+            complete_run_next_action(conn, action_id=str(row["action_id"]))
+            reconciled.append(str(row["action_id"]))
+
+    if has_durable_next_action(conn, run_id=run_id, project_id=project_id):
+        return reconciled
+
+    ready_jobs = list_jobs_for_run(conn, run_id, statuses=_EXECUTABLE_JOB)
+    if not ready_jobs:
+        return reconciled
+    next_job = sorted(ready_jobs, key=lambda j: (j.priority, j.id))[0]
+    action_id = persist_run_next_action(
+        conn,
+        run_id=run_id,
+        project_id=project_id,
+        action_type="EXECUTABLE_JOB",
+        orchestration_job_id=next_job.id,
+        payload={"job_human_id": next_job.human_id, "reconciled": True},
+    )
+    reconciled.append(action_id)
+    return reconciled
+
+
 def has_durable_next_action(
     conn: sqlite3.Connection,
     *,

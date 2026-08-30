@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from projectos.operator import load_operator_config
 from projectos.paths import DEFAULT_DB_PATH, DEFAULT_REGISTRY_PATH
 from projectos.services.context import ServiceContext
 from projectos.slack_socket import run_socket_mode
+from projectos.slack_state import write_slack_state
 
 
 def run_slack_adapter(
@@ -18,6 +20,8 @@ def run_slack_adapter(
     poll_seconds: float = 30.0,
     max_loops: int | None = None,
     require_enabled: bool = True,
+    reconnect: bool = True,
+    max_reconnect_attempts: int | None = None,
 ) -> int:
     cfg = load_operator_config()
     if require_enabled and not cfg.slack_enabled:
@@ -26,8 +30,34 @@ def run_slack_adapter(
     if not cfg.slack_enabled:
         return 0
     _ = poll_seconds
-    return run_socket_mode(ctx, max_envelopes=max_loops, require_tokens=True)
+    if not reconnect or max_loops is not None:
+        return run_socket_mode(ctx, max_envelopes=max_loops, require_tokens=True)
 
+    backoff = 1.0
+    attempt = 0
+    while True:
+        attempt += 1
+        write_slack_state(
+            {
+                "status": "connecting" if attempt == 1 else "reconnecting",
+                "reconnect_attempt": attempt,
+                "detail": "Opening Socket Mode connection"
+                if attempt == 1
+                else f"Reconnect attempt {attempt}",
+            }
+        )
+        rc = run_socket_mode(ctx, require_tokens=True)
+        if max_reconnect_attempts is not None and attempt >= max_reconnect_attempts:
+            return rc
+        write_slack_state(
+            {
+                "status": "reconnecting",
+                "reconnect_attempt": attempt,
+                "detail": f"Socket Mode disconnected; retrying in {backoff:.0f}s",
+            }
+        )
+        time.sleep(backoff)
+        backoff = min(backoff * 2.0, 60.0)
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m projectos.slack_adapter")

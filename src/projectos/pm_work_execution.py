@@ -242,6 +242,8 @@ def begin_authorized_work_execution(
                 "UPDATE orchestration_jobs SET run_id = ? WHERE id = ?",
                 (run_id, job.id),
             )
+        if scheduled:
+            continue
         persist_run_next_action(
             conn,
             run_id=run_id,

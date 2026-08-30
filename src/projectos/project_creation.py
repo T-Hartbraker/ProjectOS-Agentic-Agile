@@ -20,6 +20,7 @@ from projectos.gitutil import resolve_git_root
 from projectos.migrate import initialize_database
 from projectos.onboarding import register_project
 from projectos.pm_agent import accept_sponsor_handoff
+from projectos.domain_events import ACTOR_PM, EventContext, emit_projectos_event
 from projectos.project_defaults import load_project_defaults
 from projectos.projectctl_bridge import (
     ProjectctlStatusResult,
@@ -717,6 +718,23 @@ def create_project_from_sponsor_request(
                 execution_note=pm_result.execution_evidence or "",
             ),
         )
+        emit_projectos_event(
+            conn,
+            ctx=EventContext(
+                project_id=project_human_id,
+                handoff_id=pm_result.handoff_id,
+                run_id=pm_result.run_id,
+                slack_team_id=request.team_id,
+                slack_channel_id=request.channel_id,
+                slack_thread_ts=request.thread_ts,
+            ),
+            event_type="PROJECT_CREATED",
+            summary=result.reply_text,
+            actor_id=ACTOR_PM,
+            phase="intake",
+            detail_level="milestone",
+            metadata={"dedup_key": dedup_key, "idempotent": False},
+        )
         _record_creation(conn, dedup_key=dedup_key, request=request, result=result)
         conn.commit()
         return result
@@ -757,4 +775,8 @@ def handle_new_project_sponsor_request(
         )
     except OrchestrationError as exc:
         return {"text": str(exc), "response_type": "ephemeral"}
-    return {"text": result.reply_text, "response_type": "in_channel"}
+    return {
+        "text": result.reply_text,
+        "response_type": "in_channel",
+        "_outbox_delivered": True,
+    }

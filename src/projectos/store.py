@@ -59,9 +59,16 @@ def _sync_next_actions_for_terminal_job(
     if job.status not in TERMINAL_STATUSES:
         return
     try:
-        from projectos.run_next_actions import complete_run_next_action_for_job
+        from projectos.run_next_actions import (
+            complete_run_next_action_for_job,
+            reconcile_run_next_actions,
+        )
 
         complete_run_next_action_for_job(conn, orchestration_job_id=job.id)
+        if job.run_id:
+            reconcile_run_next_actions(
+                conn, run_id=str(job.run_id), project_id=job.project_human_id
+            )
     except Exception:
         return
 
